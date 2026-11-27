@@ -181,8 +181,9 @@ export function buildModelEvaluation(closes,volumes=[],globalWeights={},full=tru
     const actual=Math.log(closes[i]/closes[i-1]);
     for(const [key,prediction] of Object.entries(predictions)){
       if(!stats[key])continue;
+      if(Math.abs(actual)<=0.00012)continue;
       const row=stats[key];row.observations++;
-      if(Math.abs(actual)>0.00012&&Math.sign(prediction)===Math.sign(actual))row.correct++;
+      if(Math.sign(prediction)===Math.sign(actual))row.correct++;
       row.absolute_error+=Math.abs(prediction-actual);
     }
   }
@@ -198,6 +199,6 @@ export function modelCandidates(predictions,stats,globalWeights){
     const global=globalWeights[key]||{observations:0,accuracy:0.5,weight:1};
     const type=key==="primary"?"Primary hybrid":key.startsWith("meta-")?"Meta-hybrid":key.startsWith("hybrid-")?"Hybrid":"Original";
     const weight=clamp(Number(global.weight||1)*(0.75+metric.accuracy*0.5),0.4,2.0);
-    return {key,name:MODEL_LABELS[key]||key,type,signal:Number(signal),validation_accuracy:Number(metric.accuracy||0.5),mae:metric.mae,observations:Number(global.observations||0)+Number(metric.observations||0),weight};
+    return {key,name:MODEL_LABELS[key]||key,type,signal:Number(signal),validation_accuracy:Number(metric.accuracy??0.5),mae:metric.mae,observations:Number(global.observations||0)+Number(metric.observations||0),weight};
   });
 }
