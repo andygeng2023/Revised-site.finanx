@@ -176,6 +176,11 @@ function validateChronologically(close){
     if(train.length<80)continue;
     const candidates=candidateBundle(train);
     for(const c of candidates){const row=scores.get(c.name)||{observations:0,correct:0};row.observations++;if(Math.sign(c.signal)===Math.sign(actual))row.correct++;scores.set(c.name,row);}
+    const primarySignal=mean(candidates.map(c=>c.signal));
+    const primary=scores.get("Adaptive Primary Hybrid")||{observations:0,correct:0};
+    primary.observations++;
+    if(Math.sign(primarySignal)===Math.sign(actual))primary.correct++;
+    scores.set("Adaptive Primary Hybrid",primary);
   }
   return scores;
 }
@@ -228,7 +233,7 @@ async function makeAnalysis(env,job){
     history:{period,dates:rows.slice(-900).map(x=>x.date),close:rows.slice(-900).map(x=>x.close),volume:rows.slice(-900).map(x=>x.volume)},
     forecast:{horizon,hybrid:forecast,lower_bound:lower,upper_bound:upper,expected_change_percent:expected,model_name:"Adaptive Primary Hybrid"},
     risk:{score:Number(risk.toFixed(1)),annualized_volatility:Number((dailyVol*Math.sqrt(252)*100).toFixed(2)),recent_drawdown:Number((originalSignals(close).drawdown*100).toFixed(2))},
-    model:{version:modelVersion,primary:"Adaptive Primary Hybrid",original_count:15,hybrid_count:10,meta_count:3,metrics:{backtest:{directional_accuracy:Number(accuracy.toFixed(4)),validation_windows:[...splitScores.values()].reduce((s,x)=>s+x.observations,0)}},learning_observations:weighted.reduce((s,x)=>s+x.observations,0),candidates:[...weighted,{name:"Adaptive Primary Hybrid",type:"Primary hybrid",signal:dailySignal,validation_accuracy:accuracy,weight:1}]},
+    model:{version:modelVersion,primary:"Adaptive Primary Hybrid",original_count:15,hybrid_count:10,meta_count:3,metrics:{backtest:{directional_accuracy:Number(accuracy.toFixed(4)),validation_windows:[...splitScores.values()].reduce((s,x)=>s+x.observations,0)}},learning_observations:weighted.reduce((s,x)=>s+x.observations,0)+(splitScores.get("Adaptive Primary Hybrid")?.observations||0),candidates:[...weighted,{name:"Adaptive Primary Hybrid",type:"Primary hybrid",signal:dailySignal,validation_accuracy:splitScores.get("Adaptive Primary Hybrid")?.observations?splitScores.get("Adaptive Primary Hybrid").correct/splitScores.get("Adaptive Primary Hybrid").observations:accuracy,weight:1}]},
     fundamentals:{...fundamentals,source:"Yahoo Finance quote summary"}
   };
   await run(env,"UPDATE analysis_jobs SET progress=72,stage='Building forecasts and model diagnostics',updated_at=? WHERE id=?",isoNow(),job.id);
