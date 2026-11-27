@@ -49,6 +49,7 @@ test("FullIndex uses 15 original models, 10 hybrids, 3 meta-hybrids and one prim
   assert.equal(candidates.filter(x => x.type === "Hybrid").length, 10);
   assert.equal(candidates.filter(x => x.type === "Meta-hybrid").length, 3);
   assert.equal(candidates.filter(x => x.type === "Primary hybrid").length, 1);
+  assert.ok(candidates.some(x => x.name === "Linear Epsilon-SVR"));
   assert.ok(evaluation.windows > 60);
 });
 
