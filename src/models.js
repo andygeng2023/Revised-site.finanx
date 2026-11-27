@@ -26,7 +26,7 @@ const sma = (values,n)=>mean(values.slice(-n));
 const ret=(a,b)=>b>0?Math.log(a/b):0;
 
 export const FULL_MODELS = [
-  {key:"last-drift",name:"Last-Value Drift"},
+  {key:"svr-linear",name:"Linear Epsilon-SVR"},
   {key:"sma-drift",name:"Simple Moving Average Drift"},
   {key:"ema-trend",name:"Exponential Moving Average Trend"},
   {key:"linear-regression",name:"Log Linear Regression"},
@@ -42,18 +42,18 @@ export const FULL_MODELS = [
   {key:"holt-trend",name:"Holt Trend"},
   {key:"volume-weighted",name:"Volume-Weighted Trend"}
 ];
-export const PREVIEW_KEYS = ["last-drift","sma-drift","ema-trend","linear-regression","autoregression","arima-difference","momentum-20"];
+export const PREVIEW_KEYS = ["svr-linear","sma-drift","ema-trend","linear-regression","autoregression","arima-difference","momentum-20"];
 export const HYBRID_GROUPS = [
-  ["last-drift","sma-drift","ema-trend"],
+  ["svr-linear","sma-drift","ema-trend"],
   ["linear-regression","autoregression","arima-difference"],
   ["momentum-20","mean-reversion","rsi-reversion"],
   ["macd-trend","bollinger-reversion","vol-adjusted-trend"],
   ["regime-trend","holt-trend","volume-weighted"],
-  ["last-drift","linear-regression","momentum-20","regime-trend"],
+  ["svr-linear","linear-regression","momentum-20","regime-trend"],
   ["sma-drift","arima-difference","mean-reversion","holt-trend"],
   ["ema-trend","autoregression","rsi-reversion","volume-weighted"],
   ["linear-regression","macd-trend","vol-adjusted-trend","regime-trend"],
-  ["last-drift","sma-drift","ema-trend","holt-trend","volume-weighted"]
+  ["svr-linear","sma-drift","ema-trend","holt-trend","volume-weighted"]
 ];
 export const META_GROUPS = [
   ["hybrid-01","hybrid-02","hybrid-04","hybrid-06"],
@@ -67,6 +67,35 @@ export const MODEL_LABELS = Object.fromEntries([
   ["primary","Adaptive Primary Hybrid"]
 ]);
 
+function linearEpsilonSVR(logReturns){
+  const lagCount=5,training=[];
+  for(let i=lagCount;i<logReturns.length;i++){
+    training.push({x:logReturns.slice(i-lagCount,i),y:logReturns[i]*50});
+  }
+  const sample=training.slice(-180);
+  if(sample.length<30)return mean(logReturns.slice(-20))*0.6;
+  const means=Array.from({length:lagCount},(_,j)=>mean(sample.map(row=>row.x[j])));
+  const scales=Array.from({length:lagCount},(_,j)=>stdev(sample.map(row=>row.x[j]))||0.01);
+  const normalize=x=>x.map((v,j)=>(v-means[j])/scales[j]);
+  const rows=sample.map(row=>({x:normalize(row.x),y:clamp(row.y,-2.5,2.5)}));
+  let weights=Array(lagCount).fill(0),bias=mean(rows.map(row=>row.y));
+  const learningRate=0.018,regularization=0.035,epsilon=0.06;
+  for(let epoch=0;epoch<55;epoch++){
+    for(const row of rows){
+      const prediction=weights.reduce((sum,w,j)=>sum+w*row.x[j],bias);
+      const error=row.y-prediction;
+      if(Math.abs(error)<=epsilon){
+        weights=weights.map(w=>w-learningRate*regularization*w);
+        continue;
+      }
+      const direction=Math.sign(error);
+      weights=weights.map((w,j)=>w-learningRate*(regularization*w-0.08*direction*row.x[j]));
+      bias+=learningRate*0.08*direction;
+    }
+  }
+  const current=normalize(logReturns.slice(-lagCount));
+  return clamp(weights.reduce((sum,w,j)=>sum+w*current[j],bias)/50,-0.025,0.025);
+}
 export function getOriginalPredictions(closes,volumes=[]){
   const n=closes.length;
   if(n<45)throw new Error("At least 45 valid closes are required for model analysis.");
@@ -94,7 +123,7 @@ export function getOriginalPredictions(closes,volumes=[]){
   const holt=slope(closes.slice(-25).map(Math.log));
   const regime=last>longSma?1:last<longSma?-1:0;
   const predictions={
-    "last-drift":clamp(r20*0.82,-0.025,0.025),
+    "svr-linear":linearEpsilonSVR(logReturns),
     "sma-drift":clamp((sma(closes,5)/(sma(closes,20)||last)-1)*0.5,-0.025,0.025),
     "ema-trend":clamp(trend*0.45,-0.025,0.025),
     "linear-regression":clamp(regression,-0.025,0.025),
