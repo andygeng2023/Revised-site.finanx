@@ -1,4 +1,5 @@
 import PAGE from "./page.js";
+import { getOriginalPredictions, ensemblePredictions, buildModelEvaluation, modelCandidates } from "./models.js";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -121,123 +122,59 @@ function slope(values){
   values.forEach((v,i)=>{sx+=i;sy+=v;sxx+=i*i;sxy+=i*v;});
   const den=n*sxx-sx*sx;return den?((n*sxy-sx*sy)/den):0;
 }
-function originalSignals(close){
-  const r=returnsOf(close),n=close.length,tail=(a,k)=>a.slice(-k),last=close.at(-1),r5=mean(tail(r,5)),r20=mean(tail(r,20)),r60=mean(tail(r,60)),r120=mean(tail(r,120)),r252=mean(tail(r,252)),vol=std(tail(r,60))||0.01;
-  const avg=(k)=>mean(tail(close,k)),s5=avg(5),s20=avg(20),s50=avg(50),s100=avg(100),logTrend=slope(tail(close.map(Math.log),Math.min(n,90)));
-  const gains=tail(r,14).filter(x=>x>0),losses=tail(r,14).filter(x=>x<0).map(Math.abs),rs=mean(gains)/(mean(losses)||0.0001),rsi=100-100/(1+rs);
-  const max20=Math.max(...tail(close,20)),min20=Math.min(...tail(close,20));
-  const centered=(last/(s20||last)-1);
-  const raw=[
-    r20*0.75,
-    mean(tail(r,45))*0.55,
-    r5*1.3,
-    r20*1.05,
-    r60*0.72,
-    (s5/(s20||last)-1)*0.55,
-    slope(tail(close,40))/last,
-    logTrend,
-    -centered*0.32,
-    (50-rsi)/50*vol*0.35,
-    r60/(1+vol*20)*0.9,
-    (last>max20*0.995?0.0018:last<min20*1.005?-0.0018:0)+r20*0.25,
-    r20-0.25*(r5-r20),
-    median(tail(r,35))*1.4,
-    (s20/(s100||last)-1)*0.16+r60*0.18
-  ];
-  const names=["Random Walk Drift","SMA Momentum","Short Momentum","Medium Momentum","Long Momentum","EMA Crossover","Linear Regression","Log Trend","Mean Reversion","RSI Regime","Volatility-Adjusted Momentum","Breakout Trend","AR(1) Return","Robust Median Trend","Long-Term Trend"];
-  return {names,signals:raw.map(x=>clamp(x,-0.025,0.025)),volatility:vol,rsi,drawdown:last/Math.max(...tail(close,252))-1,shortAverage:s5,longAverage:s100};
-}
-function hybridSignals(original){
-  const s=original.signals;
-  const pairs=[[0,3],[2,5],[3,4],[6,7],[8,9],[10,11],[12,13],[1,14],[5,10],[7,14]];
-  const names=["Momentum Blend","Moving-Average Blend","Multi-Horizon Trend","Regression Blend","Mean-Reversion Blend","Risk-Adjusted Blend","Breakout Consensus","Drift Consensus","Technical Composite","Trend Composite"];
-  return {names,signals:pairs.map(([a,b])=>0.5*(s[a]+s[b]))};
-}
-function metaSignals(original,hybrid){
-  const h=hybrid.signals;
-  return {names:["Meta Consensus","Meta Risk-Adjusted","Meta Regime-Adaptive"],signals:[
-    mean(h),
-    mean(h.map((x,i)=>x/(1+Math.abs(x)*30))),
-    original.volatility>0.025?mean(h.slice(0,5)):mean(h.slice(5))
-  ]};
-}
-function candidateBundle(close){
-  const o=originalSignals(close),h=hybridSignals(o),m=metaSignals(o,h);
-  return [
-    ...o.names.map((name,i)=>({name,type:"Original",signal:o.signals[i]})),
-    ...h.names.map((name,i)=>({name,type:"Hybrid",signal:h.signals[i]})),
-    ...m.names.map((name,i)=>({name,type:"Meta-hybrid",signal:m.signals[i]}))
-  ];
-}
-function validateChronologically(close){
-  const count=close.length,from=Math.max(90,count-70),scores=new Map();
-  for(let i=from;i<count-6;i+=3){
-    const train=close.slice(0,i),actual=close[i+5]/close[i]-1;
-    if(train.length<80)continue;
-    const candidates=candidateBundle(train);
-    for(const c of candidates){const row=scores.get(c.name)||{observations:0,correct:0};row.observations++;if(Math.sign(c.signal)===Math.sign(actual))row.correct++;scores.set(c.name,row);}
-    const primarySignal=mean(candidates.map(c=>c.signal));
-    const primary=scores.get("Adaptive Primary Hybrid")||{observations:0,correct:0};
-    primary.observations++;
-    if(Math.sign(primarySignal)===Math.sign(actual))primary.correct++;
-    scores.set("Adaptive Primary Hybrid",primary);
-  }
-  return scores;
+async function loadGlobalWeights(env,indexer){
+  const prefix=indexer+":";
+  const rows=await all(env,"SELECT model_key,observations,correct,accuracy,weight FROM model_learning_state WHERE model_key LIKE ?",prefix+"%");
+  return Object.fromEntries(rows.map(row=>[row.model_key.slice(prefix.length),row]));
 }
 async function updateGlobalLearning(env,scoreMap,indexer){
-  for(const [name,score] of scoreMap){
-    if(!score.observations)continue;
-    const accuracy=score.correct/score.observations,modelKey=indexer+":"+name;
-    await run(env,"INSERT INTO model_learning_state(model_key,observations,correct,accuracy,weight,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(model_key) DO UPDATE SET observations=model_learning_state.observations+excluded.observations,correct=model_learning_state.correct+excluded.correct,accuracy=CAST(model_learning_state.correct+excluded.correct AS REAL)/(model_learning_state.observations+excluded.observations),weight=MAX(0.25,MIN(2.5,1.0+(CAST(model_learning_state.correct+excluded.correct AS REAL)/(model_learning_state.observations+excluded.observations)-0.5)*2.0)),updated_at=excluded.updated_at",modelKey,score.observations,score.correct,accuracy,clamp(0.8+accuracy,0.5,1.5),isoNow());
-  }
-}
-async function modelWeights(env,candidates,localScores,indexer){
-  const keys=candidates.map(x=>indexer+":"+x.name),rows=keys.length?await all(env,"SELECT model_key,observations,accuracy,weight FROM model_learning_state WHERE model_key IN ("+keys.map(()=>"?").join(",")+")",...keys):[];
-  const map=new Map(rows.map(x=>[x.model_key,x]));
-  return candidates.map(c=>{
-    const global=map.get(indexer+":"+c.name),local=localScores.get(c.name);
-    const historical=global&&Number(global.observations)>0?Number(global.accuracy):0.5;
-    const validation=local?.observations?local.correct/local.observations:historical;
-    const weight=clamp(0.35+historical*0.9+validation*0.7,0.45,2.1);
-    return {...c,validation_accuracy:validation,observations:Number(global?.observations||0)+(local?.observations||0),weight};
+  const statements=Object.entries(scoreMap).filter(([,score])=>score.observations>0).map(([key,score])=>{
+    const accuracy=score.accuracy,modelKey=indexer+":"+key;
+    return stmt(env,"INSERT INTO model_learning_state(model_key,observations,correct,accuracy,weight,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(model_key) DO UPDATE SET observations=model_learning_state.observations+excluded.observations,correct=model_learning_state.correct+excluded.correct,accuracy=CAST(model_learning_state.correct+excluded.correct AS REAL)/(model_learning_state.observations+excluded.observations),weight=MAX(0.25,MIN(2.5,1.0+(CAST(model_learning_state.correct+excluded.correct AS REAL)/(model_learning_state.observations+excluded.observations)-0.5)*2.0)),updated_at=excluded.updated_at",modelKey,score.observations,score.correct,accuracy,clamp(0.8+accuracy,0.5,1.5),isoNow());
   });
+  if(statements.length)await env.DB.batch(statements);
 }
 async function makeAnalysis(env,job){
-  const period=job.save_to_indexer==="FullIndex"?"10y":(job.period||"5y");
+  const indexer=job.save_to_indexer==="FullIndex"?"FullIndex":"PreviewIndex";
+  const period=indexer==="FullIndex"?"10y":(job.period||"5y");
   await run(env,"UPDATE analysis_jobs SET status='running',progress=5,stage='Downloading and validating market history',updated_at=? WHERE id=?",isoNow(),job.id);
   const quote=await yahooChart(job.ticker,period);
   const fundamentals=await yahooFundamentals(job.ticker);
-  const rows=quote.history,close=rows.map(x=>x.close),horizon=clamp(Number(job.horizon||30),1,504);
-  const splitScores=validateChronologically(close),indexer=job.save_to_indexer==="FullIndex"?"FullIndex":"PreviewIndex";
-  await run(env,"UPDATE analysis_jobs SET progress=33,stage='Validating 29 model candidates',updated_at=? WHERE id=?",isoNow(),job.id);
-  const candidates=candidateBundle(close),weighted=await modelWeights(env,candidates,splitScores,indexer);
-  await updateGlobalLearning(env,splitScores,indexer);
-  const original=weighted.filter(x=>x.type==="Original"),hybrids=weighted.filter(x=>x.type==="Hybrid"),meta=weighted.filter(x=>x.type==="Meta-hybrid");
-  const isFull=job.save_to_indexer==="FullIndex";
-  const ensemble=isFull?weighted:weighted.filter(x=>x.type==="Original").slice(0,7).concat(weighted.filter(x=>x.type==="Hybrid").slice(0,3),weighted.filter(x=>x.type==="Meta-hybrid").slice(0,1));
-  const weightSum=ensemble.reduce((s,x)=>s+x.weight,0)||1;
-  const dailySignal=ensemble.reduce((s,x)=>s+x.signal*x.weight,0)/weightSum;
-  const expected=clamp((Math.pow(1+dailySignal,horizon)-1)*100,-45,60);
-  const dailyVol=std(returnsOf(close).slice(-60))||0.018;
+  const rows=quote.history,closes=rows.map(x=>x.close),volumes=rows.map(x=>x.volume||0),horizon=clamp(Number(job.horizon||30),1,504);
+  await run(env,"UPDATE analysis_jobs SET progress=27,stage='Evaluating chronological holdouts',updated_at=? WHERE id=?",isoNow(),job.id);
+  const previousWeights=await loadGlobalWeights(env,indexer);
+  const full=indexer==="FullIndex";
+  const evaluation=buildModelEvaluation(closes,volumes,previousWeights,full);
+  await updateGlobalLearning(env,evaluation.stats,indexer);
+  await run(env,"UPDATE analysis_jobs SET progress=57,stage='Updating global model profiles',updated_at=? WHERE id=?",isoNow(),job.id);
+  const globalWeights=await loadGlobalWeights(env,indexer);
+  const original=getOriginalPredictions(closes,volumes);
+  const predictions=ensemblePredictions(original.predictions,globalWeights,full);
+  const candidates=modelCandidates(predictions,evaluation.stats,globalWeights);
+  const dailySignal=clamp(Number(predictions.primary||0),-0.02,0.02);
+  const dailyVol=Number(original.diagnostics.volatility||0.015);
+  let cumulative=0;
   const forecast=[],lower=[],upper=[];
   for(let i=1;i<=horizon;i++){
-    const trend=Math.pow(1+dailySignal,i),uncertainty=1.65*dailyVol*Math.sqrt(i);
-    forecast.push(Number((close.at(-1)*trend).toFixed(4)));
-    lower.push(Number((close.at(-1)*trend*Math.exp(-uncertainty)).toFixed(4)));
-    upper.push(Number((close.at(-1)*trend*Math.exp(uncertainty)).toFixed(4)));
+    cumulative+=dailySignal*Math.pow(0.965,i-1);
+    const center=closes.at(-1)*Math.exp(cumulative),uncertainty=1.65*dailyVol*Math.sqrt(i);
+    forecast.push(Number(center.toFixed(4)));
+    lower.push(Number((closes.at(-1)*Math.exp(cumulative-uncertainty)).toFixed(4)));
+    upper.push(Number((closes.at(-1)*Math.exp(cumulative+uncertainty)).toFixed(4)));
   }
-  const accuracy=ensemble.map(x=>x.validation_accuracy).reduce((s,x)=>s+x,0)/(ensemble.length||1);
-  const risk=clamp(35+dailyVol*1100+Math.max(0,-originalSignals(close).drawdown)*80,0,100);
-  const modelVersion=job.save_to_indexer==="FullIndex"?FULL_VERSION:PREVIEW_VERSION;
+  const expected=forecast.length?100*(forecast.at(-1)/closes.at(-1)-1):0;
+  const accuracy=Number(evaluation.stats.primary?.accuracy??0.5);
+  const risk=clamp(30+dailyVol*1200+Math.max(0,-Number(original.diagnostics.drawdown||0))*85,0,100);
+  const modelVersion=full?"finanx-full-ensemble-v2":"finanx-preview-ensemble-v2";
   const result={
     ticker:job.ticker,company:quote.company,currency:quote.currency,exchange:quote.exchange,price:quote.price,change_percent:quote.change_percent,as_of:quote.as_of,data_source:quote.source,indexed_at:isoNow(),
     history:{period,dates:rows.slice(-2600).map(x=>x.date),close:rows.slice(-2600).map(x=>x.close),volume:rows.slice(-2600).map(x=>x.volume)},
-    forecast:{horizon,hybrid:forecast,lower_bound:lower,upper_bound:upper,expected_change_percent:expected,model_name:"Adaptive Primary Hybrid"},
-    risk:{score:Number(risk.toFixed(1)),annualized_volatility:Number((dailyVol*Math.sqrt(252)*100).toFixed(2)),recent_drawdown:Number((originalSignals(close).drawdown*100).toFixed(2))},
-    model:{version:modelVersion,primary:"Adaptive Primary Hybrid",original_count:isFull?15:7,hybrid_count:isFull?10:3,meta_count:isFull?3:1,metrics:{backtest:{directional_accuracy:Number(accuracy.toFixed(4)),validation_windows:[...splitScores.values()].reduce((s,x)=>s+x.observations,0)}},learning_observations:ensemble.reduce((s,x)=>s+x.observations,0)+(splitScores.get("Adaptive Primary Hybrid")?.observations||0),candidates:[...ensemble,{name:"Adaptive Primary Hybrid",type:"Primary hybrid",signal:dailySignal,validation_accuracy:splitScores.get("Adaptive Primary Hybrid")?.observations?splitScores.get("Adaptive Primary Hybrid").correct/splitScores.get("Adaptive Primary Hybrid").observations:accuracy,weight:1}]},
+    forecast:{horizon,hybrid:forecast,lower_bound:lower,upper_bound:upper,expected_change_percent:Number(expected.toFixed(2)),model_name:"Adaptive Primary Hybrid"},
+    risk:{score:Number(risk.toFixed(1)),annualized_volatility:Number((dailyVol*Math.sqrt(252)*100).toFixed(2)),recent_drawdown:Number((Number(original.diagnostics.drawdown||0)*100).toFixed(2)),rsi:Number(original.diagnostics.rsi||50).toFixed(1)},
+    model:{version:modelVersion,primary:"Adaptive Primary Hybrid",original_count:full?15:7,hybrid_count:10,meta_count:3,metrics:{backtest:{directional_accuracy:Number(accuracy.toFixed(4)),validation_windows:evaluation.windows,validation_horizon:"1 trading day"}},learning_observations:candidates.reduce((sum,c)=>sum+c.observations,0),candidates},
     fundamentals:{...fundamentals,source:"Yahoo Finance quote summary"}
   };
-  await run(env,"UPDATE analysis_jobs SET progress=72,stage='Building forecasts and model diagnostics',updated_at=? WHERE id=?",isoNow(),job.id);
+  await run(env,"UPDATE analysis_jobs SET progress=86,stage='Writing shared index and forecast',updated_at=? WHERE id=?",isoNow(),job.id);
   return result;
 }
 async function enqueueJob(env,job){
