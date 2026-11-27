@@ -72,7 +72,7 @@ function linearEpsilonSVR(logReturns){
   for(let i=lagCount;i<logReturns.length;i++){
     training.push({x:logReturns.slice(i-lagCount,i),y:logReturns[i]*50});
   }
-  const sample=training.slice(-180);
+  const sample=training.slice(-90);
   if(sample.length<30)return mean(logReturns.slice(-20))*0.6;
   const means=Array.from({length:lagCount},(_,j)=>mean(sample.map(row=>row.x[j])));
   const scales=Array.from({length:lagCount},(_,j)=>stdev(sample.map(row=>row.x[j]))||0.01);
@@ -80,7 +80,7 @@ function linearEpsilonSVR(logReturns){
   const rows=sample.map(row=>({x:normalize(row.x),y:clamp(row.y,-2.5,2.5)}));
   let weights=Array(lagCount).fill(0),bias=mean(rows.map(row=>row.y));
   const learningRate=0.018,regularization=0.035,epsilon=0.06;
-  for(let epoch=0;epoch<55;epoch++){
+  for(let epoch=0;epoch<22;epoch++){
     for(const row of rows){
       const prediction=weights.reduce((sum,w,j)=>sum+w*row.x[j],bias);
       const error=row.y-prediction;
@@ -168,7 +168,7 @@ export function ensemblePredictions(original,globalWeights={},full=true){
   return predictions;
 }
 export function buildModelEvaluation(closes,volumes=[],globalWeights={},full=true){
-  const start=Math.max(90,closes.length-130),stats={};
+  const start=Math.max(90,closes.length-70),stats={};
   for(const model of FULL_MODELS)stats[model.key]={observations:0,correct:0,absolute_error:0};
   for(let i=0;i<HYBRID_GROUPS.length;i++)stats["hybrid-"+String(i+1).padStart(2,"0")]={observations:0,correct:0,absolute_error:0};
   for(let i=0;i<META_GROUPS.length;i++)stats["meta-"+String(i+1).padStart(2,"0")]={observations:0,correct:0,absolute_error:0};
