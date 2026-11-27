@@ -8,7 +8,7 @@ A self-contained stock research and analysis application delivered by Cloudflare
 - PreviewIndex and FullIndex with persistent two-button selection on the stock detail page.
 - Default PreviewIndex analysis for a newly entered ticker, with FullIndex available as an alternative.
 - Yahoo Finance chart data with short-lived quote caching and a second Yahoo host as a network fallback.
-- 15 original estimator signals, 10 first-layer hybrids, 3 meta-hybrids and an adaptive primary ensemble in FullIndex; PreviewIndex runs a smaller 21-candidate set (7 + 10 + 3 + primary). Each index maintains separate global performance profiles.
+- 15 original estimator signals (including a differenced ARIMA approximation and linear epsilon-SVR), 10 first-layer hybrids, 3 meta-hybrids and an adaptive primary ensemble in FullIndex; PreviewIndex runs a smaller 21-candidate set (7 + 10 + 3 + primary). Each index maintains separate global performance profiles.
 - Rolling chronological one-day validation and aggregate cross-account model-learning statistics. Each index keeps a separate global profile for the models it runs.
 - Historical and forecast charts, risk context, fundamentals where Yahoo returns them, and model diagnostics.
 - Account signup/sign-in, 30-day sessions, and user-scoped watchlists.
@@ -38,7 +38,7 @@ All account, watchlist and market-index data in this deployment starts in a fres
 
 ## Deploy
 
-The live Worker has been uploaded directly to the Cloudflare Workers API (deployment ID: `67099c95a0ec4d6a88b7cba433410192`). For repeatable future deployments, connect this repository to Cloudflare Workers Builds in the Cloudflare dashboard (Workers & Pages → Create → Workers → Connect to Git). Select this repository and the `main` branch; use `npm install` as the install command and `npx wrangler deploy` as the deploy command. Do not add a GitHub Actions workflow.
+The live Worker has been uploaded directly to the Cloudflare Workers API (deployment ID: `67099c95a0ec4d6a88b7cba433410192`). For repeatable future deployments, connect this repository to Cloudflare Workers Builds in the Cloudflare dashboard (Workers & Pages → Create → Workers → Connect to Git). Select this repository and the `main` branch; use `npm install` as the install command and `npm test && npx wrangler deploy` as the build/deploy command. Do not add a GitHub Actions workflow.
 
 The same bindings must be present on the Worker build:
 - D1: `DB` → `revised-finanx-db`
