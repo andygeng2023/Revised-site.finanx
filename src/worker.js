@@ -320,12 +320,36 @@ async function refreshIndexes(env,indexer){
   }
   for(let i=0;i<batch.length;i+=100)await env.ANALYSIS_QUEUE.sendBatch(batch.slice(i,i+100));
 }
+async function modelLearning(url,env){
+  const indexer=(url.searchParams.get("indexer")||"PreviewIndex").toLowerCase()==="fullindex"?"FullIndex":"PreviewIndex";
+  const prefix=indexer+":";
+  const rows=await all(env,"SELECT model_key,observations,correct,accuracy,weight,updated_at FROM model_learning_state WHERE model_key LIKE ? ORDER BY accuracy DESC",prefix+"%");
+  return json({indexer,profiles:rows.map(row=>({...row,key:row.model_key.slice(prefix.length)})),profile_count:rows.length,observations:rows.reduce((sum,row)=>sum+Number(row.observations||0),0),updated_at:rows[0]?.updated_at||null});
+}
+async function queueStatus(req,env){
+  const user=await authUser(req,env),cutoff=new Date(Date.now()-7*86400000).toISOString();
+  const rows=user
+    ? await all(env,"SELECT status,COUNT(*) AS count FROM analysis_jobs WHERE (user_id=? OR job_type='scan') AND created_at>=? GROUP BY status",user.id,cutoff)
+    : await all(env,"SELECT status,COUNT(*) AS count FROM analysis_jobs WHERE job_type='scan' AND created_at>=? GROUP BY status",cutoff);
+  const counts={queued:0,running:0,completed:0,failed:0};
+  for(const row of rows)counts[row.status]=(counts[row.status]||0)+Number(row.count||0);
+  return json({counts,active:counts.queued+counts.running,total:Object.values(counts).reduce((a,b)=>a+b,0),updated_at:isoNow()});
+}
+async function searchRoute(url,env){
+  const query=url.searchParams.get("q")||url.searchParams.get("query")||"";
+  if(!query.trim())return json({suggestions:[]});
+  const next=new URL(url.toString());next.pathname="/api/market-feed";next.searchParams.set("q",query);
+  return marketFeed(next,env);
+}
 async function handleApi(req,env,url){
   const path=url.pathname;
   if(req.method==="OPTIONS")return new Response(null,{status:204,headers:CORS});
   if(path==="/api/health")return json({ok:true,service:"revised-finanx",database:"D1",queue:"Cloudflare Queues",time:isoNow()});
   if(path.startsWith("/api/auth/"))return authRoute(req,env,url);
   if(path==="/api/market-feed"&&req.method==="GET")return marketFeed(url,env);
+  if(path==="/api/search"&&req.method==="GET")return searchRoute(url,env);
+  if(path==="/api/model-learning"&&req.method==="GET")return modelLearning(url,env);
+  if(path==="/api/queue-status"&&req.method==="GET")return queueStatus(req,env);
   if(path==="/api/watchlist"&&req.method==="POST")return watchlist(req,env);
   if(path==="/api/market-scan"&&req.method==="POST")return requestMarketScan(env);
   if(path==="/api/jobs"&&req.method==="GET")return listJobs(req,env);
