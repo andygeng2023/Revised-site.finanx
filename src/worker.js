@@ -101,6 +101,17 @@ async function yahooChart(ticker,period){
   }
   throw lastError||new Error("Market data unavailable.");
 }
+async function yahooFundamentals(ticker){
+  const url=new URL("https://query1.finance.yahoo.com/v10/finance/quoteSummary/"+encodeURIComponent(ticker));
+  url.searchParams.set("modules","price,summaryDetail,assetProfile,defaultKeyStatistics,financialData");
+  try{
+    const response=await fetch(url,{headers:{"User-Agent":"Mozilla/5.0 FinanxResearch/1.0"},signal:AbortSignal.timeout(9000)});
+    if(!response.ok)return {};
+    const data=await response.json(),item=data?.quoteSummary?.result?.[0]||{};
+    const raw=x=>x&&typeof x==="object"&&"raw"in x?x.raw:null;
+    return {sector:item.assetProfile?.sector||null,industry:item.assetProfile?.industry||null,market_cap:raw(item.price?.marketCap),trailing_pe:raw(item.summaryDetail?.trailingPE),forward_pe:raw(item.summaryDetail?.forwardPE),profit_margin:raw(item.financialData?.profitMargins),return_on_equity:raw(item.financialData?.returnOnEquity),dividend_yield:raw(item.summaryDetail?.dividendYield),beta:raw(item.defaultKeyStatistics?.beta),employees:item.assetProfile?.fullTimeEmployees||null,website:item.assetProfile?.website||null};
+  }catch{return {};}
+}
 function returnsOf(close){const r=[];for(let i=1;i<close.length;i++)if(close[i-1]>0&&close[i]>0)r.push(close[i]/close[i-1]-1);return r;}
 function mean(a){return a.length?a.reduce((s,v)=>s+v,0)/a.length:0;}
 function median(a){if(!a.length)return 0;const x=[...a].sort((p,q)=>p-q);return x[Math.floor(x.length/2)];}
@@ -190,6 +201,7 @@ async function makeAnalysis(env,job){
   const period=job.save_to_indexer==="FullIndex"?"10y":(job.period||"5y");
   await run(env,"UPDATE analysis_jobs SET status='running',progress=5,stage='Downloading and validating market history',updated_at=? WHERE id=?",isoNow(),job.id);
   const quote=await yahooChart(job.ticker,period);
+  const fundamentals=await yahooFundamentals(job.ticker);
   const rows=quote.history,close=rows.map(x=>x.close),horizon=clamp(Number(job.horizon||30),1,504);
   const splitScores=validateChronologically(close);
   await run(env,"UPDATE analysis_jobs SET progress=33,stage='Validating 28 model candidates',updated_at=? WHERE id=?",isoNow(),job.id);
@@ -217,7 +229,7 @@ async function makeAnalysis(env,job){
     forecast:{horizon,hybrid:forecast,lower_bound:lower,upper_bound:upper,expected_change_percent:expected,model_name:"Adaptive Primary Hybrid"},
     risk:{score:Number(risk.toFixed(1)),annualized_volatility:Number((dailyVol*Math.sqrt(252)*100).toFixed(2)),recent_drawdown:Number((originalSignals(close).drawdown*100).toFixed(2))},
     model:{version:modelVersion,primary:"Adaptive Primary Hybrid",original_count:15,hybrid_count:10,meta_count:3,metrics:{backtest:{directional_accuracy:Number(accuracy.toFixed(4)),validation_windows:[...splitScores.values()].reduce((s,x)=>s+x.observations,0)}},learning_observations:weighted.reduce((s,x)=>s+x.observations,0),candidates:[...weighted,{name:"Adaptive Primary Hybrid",type:"Primary hybrid",signal:dailySignal,validation_accuracy:accuracy,weight:1}]},
-    fundamentals:{sector:null,industry:null,market_cap:null,source:"Not provided by the quote endpoint"}
+    fundamentals:{...fundamentals,source:"Yahoo Finance quote summary"}
   };
   await run(env,"UPDATE analysis_jobs SET progress=72,stage='Building forecasts and model diagnostics',updated_at=? WHERE id=?",isoNow(),job.id);
   return result;
@@ -278,7 +290,9 @@ async function marketFeed(url,env){
   const tickers=catalog.length?catalog.map(x=>x.ticker):POPULAR;
   const items=await Promise.all(tickers.slice(0,18).map(async ticker=>{
     try{
-      const quote=await yahooChart(ticker,"1y");
+      const cachedQuote=await first(env,"SELECT * FROM market_quotes WHERE ticker=? AND updated_at>=?",ticker,new Date(Date.now()-5*60000).toISOString());
+      const quote=cachedQuote?{ticker,company:cachedQuote.company,currency:cachedQuote.currency,price:cachedQuote.price,change_percent:cachedQuote.change_percent,as_of:cachedQuote.as_of,history:[],source:cachedQuote.source}:await yahooChart(ticker,"1y");
+      if(!cachedQuote)await run(env,"INSERT INTO market_quotes(ticker,company,currency,price,change_percent,as_of,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,price=excluded.price,change_percent=excluded.change_percent,as_of=excluded.as_of,source=excluded.source,updated_at=excluded.updated_at",ticker,quote.company,quote.currency,quote.price,quote.change_percent,quote.as_of,quote.source,isoNow());
       const full=await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period='10y' AND horizon=30 AND indexer='FullIndex'",ticker);
       const preview=full?null:await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period='5y' AND horizon=30 AND indexer='PreviewIndex'",ticker);
       const row=full||preview,indexer=full?"FullIndex":preview?"PreviewIndex":null,result=parse(row?.result);
@@ -314,6 +328,20 @@ async function watchlist(req,env){
   }));
   return json({items:output});
 }
+async function requestMarketScan(env){
+  const tickers=POPULAR.slice(0,12),started=[],cached=[];
+  for(const ticker of tickers){
+    const fresh=await first(env,"SELECT indexed_at FROM market_index WHERE ticker=? AND period='5y' AND horizon=30 AND indexer='PreviewIndex' AND indexed_at>=?",ticker,new Date(Date.now()-8*3600000).toISOString());
+    if(fresh){cached.push(ticker);continue;}
+    const active=await first(env,"SELECT id FROM analysis_jobs WHERE ticker=? AND save_to_indexer='PreviewIndex' AND status IN ('queued','running') LIMIT 1",ticker);
+    if(active){started.push({ticker,id:active.id,reused:true});continue;}
+    const id=crypto.randomUUID(),created=isoNow();
+    await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,save_to_indexer,status,created_at,updated_at,progress,stage) VALUES(?,?,'5y',30,'PreviewIndex','queued',?,?,0,'Market scan queued')",id,ticker,created,created);
+    await env.ANALYSIS_QUEUE.send({jobId:id});
+    started.push({ticker,id,reused:false});
+  }
+  return json({queued:started.length,cached:cached.length,jobs:started,cached_tickers:cached,message:"Market scan submitted to shared workers."},202);
+}
 async function listJobs(req,env){
   const user=await authUser(req,env);
   if(user)return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,status,progress,stage,updated_at FROM analysis_jobs WHERE user_id=? ORDER BY created_at DESC LIMIT 40",user.id)});
@@ -328,7 +356,7 @@ async function processJob(id,env){
     const indexer=job.save_to_indexer==="FullIndex"?"FullIndex":"PreviewIndex",period=indexer==="FullIndex"?"10y":"5y";
     const stored=JSON.stringify(result);
     await run(env,"INSERT INTO market_index(ticker,period,horizon,indexer,indexed_at,source_job_id,result) VALUES(?,?,?,?,?,?,?) ON CONFLICT(ticker,period,horizon,indexer) DO UPDATE SET indexed_at=excluded.indexed_at,source_job_id=excluded.source_job_id,result=excluded.result",job.ticker,period,job.horizon,indexer,isoNow(),id,stored);
-    await run(env,"UPDATE ticker_catalog SET company=?,currency=?,last_indexed_at=? WHERE ticker=?",result.company,result.currency,isoNow(),job.ticker);
+    await run(env,"INSERT INTO ticker_catalog(ticker,company,currency,last_indexed_at,created_at) VALUES(?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,last_indexed_at=excluded.last_indexed_at",job.ticker,result.company,result.currency,isoNow(),isoNow());
     await run(env,"UPDATE analysis_jobs SET status='completed',result=?,error=NULL,progress=100,stage='Analysis complete',updated_at=? WHERE id=?",stored,isoNow(),id);
   }catch(error){
     const message=String(error?.message||error||"Analysis failed").slice(0,800);
@@ -356,6 +384,7 @@ async function handleApi(req,env,url){
   if(path.startsWith("/api/auth/"))return authRoute(req,env,url);
   if(path==="/api/market-feed"&&req.method==="GET")return marketFeed(url,env);
   if(path==="/api/watchlist"&&req.method==="POST")return watchlist(req,env);
+  if(path==="/api/market-scan"&&req.method==="POST")return requestMarketScan(env);
   if(path==="/api/jobs"&&req.method==="GET")return listJobs(req,env);
   if(path==="/api/request-analysis"&&req.method==="POST")return requestAnalysis(req,env);
   if(path==="/api/analysis-status"&&req.method==="GET")return analysisStatus(url,env);
