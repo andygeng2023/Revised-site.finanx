@@ -336,7 +336,7 @@ async function requestMarketScan(env){
     const active=await first(env,"SELECT id FROM analysis_jobs WHERE ticker=? AND save_to_indexer='PreviewIndex' AND status IN ('queued','running') LIMIT 1",ticker);
     if(active){started.push({ticker,id:active.id,reused:true});continue;}
     const id=crypto.randomUUID(),created=isoNow();
-    await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,save_to_indexer,status,created_at,updated_at,progress,stage) VALUES(?,?,'5y',30,'PreviewIndex','queued',?,?,0,'Market scan queued')",id,ticker,created,created);
+    await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,job_type,save_to_indexer,status,created_at,updated_at,progress,stage) VALUES(?,?,'5y',30,'scan','PreviewIndex','queued',?,?,0,'Market scan queued')",id,ticker,created,created);
     await env.ANALYSIS_QUEUE.send({jobId:id});
     started.push({ticker,id,reused:false});
   }
@@ -344,8 +344,8 @@ async function requestMarketScan(env){
 }
 async function listJobs(req,env){
   const user=await authUser(req,env);
-  if(user)return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,status,progress,stage,updated_at FROM analysis_jobs WHERE user_id=? ORDER BY created_at DESC LIMIT 40",user.id)});
-  return json({jobs:[]});
+  if(user)return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,status,progress,stage,updated_at FROM analysis_jobs WHERE user_id=? OR job_type='scan' ORDER BY created_at DESC LIMIT 40",user.id)});
+  return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,status,progress,stage,updated_at FROM analysis_jobs WHERE job_type='scan' ORDER BY created_at DESC LIMIT 24")});
 }
 async function processJob(id,env){
   const job=await first(env,"SELECT * FROM analysis_jobs WHERE id=?",id);
