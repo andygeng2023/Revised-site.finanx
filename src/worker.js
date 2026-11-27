@@ -410,7 +410,13 @@ export default {
   async queue(batch,env){
     for(const message of batch.messages){
       try{const id=message.body?.jobId;if(!id)throw new Error("Queue message has no jobId");await processJob(id,env);message.ack();}
-      catch(error){console.error("Queue job failed",error);message.retry({delaySeconds:Math.min(300,20*Math.max(1,message.attempts||1))});}
+      catch(error){
+        console.error("Queue job failed",error);
+        const id=message.body?.jobId,attempts=Number(message.attempts||1);
+        if(id&&attempts<5)await run(env,"UPDATE analysis_jobs SET status='queued',progress=0,stage='Retrying after a temporary worker error',error=?,updated_at=? WHERE id=?",String(error?.message||error).slice(0,800),isoNow(),id);
+        else if(id)await run(env,"UPDATE analysis_jobs SET status='failed',progress=0,stage='Retry limit reached',error=?,updated_at=? WHERE id=?",String(error?.message||error).slice(0,800),isoNow(),id);
+        message.retry({delaySeconds:Math.min(300,20*Math.max(1,attempts))});
+      }
     }
   },
   async scheduled(controller,env,ctx){
