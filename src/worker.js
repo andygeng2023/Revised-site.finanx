@@ -230,7 +230,7 @@ async function makeAnalysis(env,job){
   const modelVersion=job.save_to_indexer==="FullIndex"?FULL_VERSION:PREVIEW_VERSION;
   const result={
     ticker:job.ticker,company:quote.company,currency:quote.currency,exchange:quote.exchange,price:quote.price,change_percent:quote.change_percent,as_of:quote.as_of,data_source:quote.source,indexed_at:isoNow(),
-    history:{period,dates:rows.slice(-900).map(x=>x.date),close:rows.slice(-900).map(x=>x.close),volume:rows.slice(-900).map(x=>x.volume)},
+    history:{period,dates:rows.slice(-2600).map(x=>x.date),close:rows.slice(-2600).map(x=>x.close),volume:rows.slice(-2600).map(x=>x.volume)},
     forecast:{horizon,hybrid:forecast,lower_bound:lower,upper_bound:upper,expected_change_percent:expected,model_name:"Adaptive Primary Hybrid"},
     risk:{score:Number(risk.toFixed(1)),annualized_volatility:Number((dailyVol*Math.sqrt(252)*100).toFixed(2)),recent_drawdown:Number((originalSignals(close).drawdown*100).toFixed(2))},
     model:{version:modelVersion,primary:"Adaptive Primary Hybrid",original_count:15,hybrid_count:10,meta_count:3,metrics:{backtest:{directional_accuracy:Number(accuracy.toFixed(4)),validation_windows:[...splitScores.values()].reduce((s,x)=>s+x.observations,0)}},learning_observations:weighted.reduce((s,x)=>s+x.observations,0)+(splitScores.get("Adaptive Primary Hybrid")?.observations||0),candidates:[...weighted,{name:"Adaptive Primary Hybrid",type:"Primary hybrid",signal:dailySignal,validation_accuracy:splitScores.get("Adaptive Primary Hybrid")?.observations?splitScores.get("Adaptive Primary Hybrid").correct/splitScores.get("Adaptive Primary Hybrid").observations:accuracy,weight:1}]},
