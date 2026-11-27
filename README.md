@@ -8,8 +8,8 @@ A self-contained stock research and analysis application delivered by Cloudflare
 - PreviewIndex and FullIndex with persistent two-button selection on the stock detail page.
 - Default PreviewIndex analysis for a newly entered ticker, with FullIndex available as an alternative.
 - Yahoo Finance chart data with short-lived quote caching and a second Yahoo host as a network fallback.
-- 15 original estimator signals, 10 first-layer hybrids, 3 meta-hybrids and an adaptive primary ensemble.
-- Chronological validation and aggregate cross-account model-learning statistics.
+- 15 original estimator signals, 10 first-layer hybrids, 3 meta-hybrids and an adaptive primary ensemble in FullIndex; PreviewIndex runs a smaller 21-candidate set (7 + 10 + 3 + primary). Each index maintains separate global performance profiles.
+- Rolling chronological one-day validation and aggregate cross-account model-learning statistics. Each index keeps a separate global profile for the models it runs.
 - Historical and forecast charts, risk context, fundamentals where Yahoo returns them, and model diagnostics.
 - Account signup/sign-in, 30-day sessions, and user-scoped watchlists.
 - Cloudflare Queues for analysis jobs, retry handling and a dead-letter queue.
