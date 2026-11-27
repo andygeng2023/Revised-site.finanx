@@ -38,7 +38,7 @@ All account, watchlist and market-index data in this deployment starts in a fres
 
 ## Deploy
 
-The live Worker has been uploaded directly to the Cloudflare Workers API. For repeatable future deployments, connect this repository to Cloudflare Workers Builds in the Cloudflare dashboard (Workers & Pages → Create → Workers → Connect to Git). Select this repository and the `main` branch; use `npm install` as the install command and `npx wrangler deploy` as the deploy command. Do not add a GitHub Actions workflow.
+The live Worker has been uploaded directly to the Cloudflare Workers API (deployment ID: `67099c95a0ec4d6a88b7cba433410192`). For repeatable future deployments, connect this repository to Cloudflare Workers Builds in the Cloudflare dashboard (Workers & Pages → Create → Workers → Connect to Git). Select this repository and the `main` branch; use `npm install` as the install command and `npx wrangler deploy` as the deploy command. Do not add a GitHub Actions workflow.
 
 The same bindings must be present on the Worker build:
 - D1: `DB` → `revised-finanx-db`
@@ -46,9 +46,13 @@ The same bindings must be present on the Worker build:
 - Queue consumer: `revised-finanx-analysis`, batch size 5, 5 retries, dead-letter queue `revised-finanx-analysis-dlq`
 - Cron: `0 */6 * * *` and `0 2 * * *`
 
-## Domain
+## Live address
 
-Once the Worker is deployed, add a Worker custom domain from Cloudflare's Worker settings. If you use a DNS provider outside Cloudflare, create the CNAME record it instructs you to use. The app is also available at its `.workers.dev` hostname.
+The deployed app is available at:
+
+`https://revised-finanx.stock-analyser-2026.workers.dev`
+
+The account's current DNS zone list does not include `is-a-fullstack.dev`, so the Worker cannot yet be attached to `site.finanx.is-a-fullstack.dev`. A custom domain can be added after that zone is managed in the same Cloudflare account (or a domain owned by you is added there).
 
 ## Notes and limitations
 
