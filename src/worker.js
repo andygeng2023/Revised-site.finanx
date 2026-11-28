@@ -7,7 +7,7 @@ const CORS = {
   "Access-Control-Allow-Headers": "Authorization,Content-Type",
   "Content-Type": "application/json; charset=utf-8"
 };
-const POPULAR = ["AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA","BRK-B","JPM","LLY","AVGO","COST"];
+const POPULAR = ["AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA","BRK-B","JPM","LLY","AVGO","COST","AMD","NFLX","ORCL","CRM","ADBE","QCOM","INTC","WMT","HD","PG","KO","PEP","BAC","XOM","CVX","UNH","V","MA","DIS","UBER","PLTR","SHOP","SNOW","SPY","QQQ","DIA","IWM"];
 const PREVIEW_VERSION = "finanx-preview-1";
 const FULL_VERSION = "finanx-full-1";
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, Number.isFinite(n) ? n : 0));
@@ -231,7 +231,7 @@ async function marketFeed(url,env){
   }
   const catalog=await all(env,"SELECT ticker,company,currency FROM ticker_catalog ORDER BY ticker LIMIT 60");
   const tickers=catalog.length?catalog.map(x=>x.ticker):POPULAR;
-  const items=await Promise.all(tickers.slice(0,18).map(async ticker=>{
+  const items=await Promise.all(tickers.slice(0,36).map(async ticker=>{
     try{
       const cachedQuote=await first(env,"SELECT * FROM market_quotes WHERE ticker=? AND updated_at>=?",ticker,new Date(Date.now()-5*60000).toISOString());
       const quote=cachedQuote?{ticker,company:cachedQuote.company,currency:cachedQuote.currency,price:cachedQuote.price,change_percent:cachedQuote.change_percent,as_of:cachedQuote.as_of,history:[],source:cachedQuote.source}:await yahooChart(ticker,"1y");
