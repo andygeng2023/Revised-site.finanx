@@ -167,6 +167,14 @@ body{background:radial-gradient(ellipse at 78% -18%,rgba(55,100,145,.25),transpa
 .feed-list>.feed-row{display:flex!important;flex:0 0 230px!important;width:230px!important;min-width:230px!important;max-width:230px!important;min-height:125px!important;height:auto!important;align-items:flex-start!important;justify-content:space-between!important;gap:12px!important;border:1px solid rgba(143,171,204,.18)!important;border-radius:13px!important;background:linear-gradient(150deg,#14263d,#101c2c)!important;padding:13px!important;scroll-snap-align:start!important;}
 .feed-list>.feed-row>div{min-width:0!important}.feed-list>.feed-row .feed-price{text-align:right!important;white-space:normal!important}.feed-list>.empty{flex:0 0 100%!important;width:100%!important;min-width:100%!important;}
 @media(max-width:760px){.feed-list>.feed-row{flex-basis:210px!important;width:210px!important;min-width:210px!important;max-width:210px!important;min-height:118px!important;padding:12px!important}}
+
+/* Final horizontal-card rails: all market and feed lists */
+.cards,.feed-list,.intel-list{display:flex!important;flex-wrap:nowrap!important;overflow-x:auto!important;overflow-y:hidden!important;scrollbar-width:thin;scroll-snap-type:x mandatory!important;overscroll-behavior-x:contain;gap:12px!important;padding:4px 2px 14px!important;min-width:0}
+.cards>.stock-card{flex:0 0 230px!important;width:230px!important;min-width:230px!important;max-width:230px!important;scroll-snap-align:start;min-height:212px}
+.feed-list>.feed-row,.intel-list>.feed-row{flex:0 0 230px!important;width:230px!important;min-width:230px!important;max-width:230px!important;scroll-snap-align:start;border:1px solid var(--line)!important;border-radius:14px!important;background:linear-gradient(145deg,#102039,#0d1a2b)!important;padding:13px!important;min-height:84px;box-sizing:border-box}
+.feed-list>.empty,.intel-list>.empty{flex:0 0 230px!important;width:230px!important;min-width:230px!important;max-width:230px!important;scroll-snap-align:start;border:1px dashed var(--line);border-radius:12px;padding:14px;box-sizing:border-box}
+.intel-grid{grid-template-columns:1fr!important}
+@media(max-width:760px){.cards>.stock-card{flex-basis:205px!important;width:205px!important;min-width:205px!important;max-width:205px!important}.feed-list>.feed-row,.intel-list>.feed-row,.feed-list>.empty,.intel-list>.empty{flex-basis:205px!important;width:205px!important;min-width:205px!important;max-width:205px!important}.intel-grid{grid-template-columns:1fr!important}}
 </style>
 </head>
 <body>
