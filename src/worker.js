@@ -446,8 +446,8 @@ async function handleApi(req,env,url){
   if(path==="/api/health"){
     try{
       await first(env,"SELECT 1 AS ok");
-      const queueReady=typeof env.ANALYSIS_QUEUE?.send==="function";
-      return json({ok:queueReady,service:"revised-finanx",database:"D1",queue:queueReady?"Cloudflare Queues":"Unavailable",time:isoNow()},queueReady?200:503);
+      const queueReady=typeof env.ANALYSIS_QUEUE?.send==="function",fullIndexQueueReady=typeof env.FULLINDEX_QUEUE?.sendBatch==="function",ok=queueReady&&fullIndexQueueReady;
+      return json({ok,service:"revised-finanx",database:"D1",queue:queueReady?"Cloudflare Queues":"Unavailable",full_index_queue:fullIndexQueueReady?"Bound":"Unavailable",time:isoNow()},ok?200:503);
     }catch(error){return json({ok:false,service:"revised-finanx",database:"Unavailable",queue:typeof env.ANALYSIS_QUEUE?.send==="function"?"Cloudflare Queues":"Unavailable",time:isoNow()},503);}
   }
   if(path.startsWith("/api/auth/"))return authRoute(req,env,url);
