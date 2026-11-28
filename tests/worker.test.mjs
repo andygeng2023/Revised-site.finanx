@@ -34,6 +34,7 @@ function testEnv({ firstResult = null, failDatabase = false } = {}) {
     },
     ANALYSIS_QUEUE: { send: async () => { calls.queue++; }, sendBatch: async messages => { calls.batchMessages.push(...messages); } },
     FULLINDEX_QUEUE: { send: async () => {}, sendBatch: async messages => { calls.batchMessages.push(...messages); } },
+    PREVIEWINDEX_QUEUE: { send: async () => {}, sendBatch: async messages => { calls.batchMessages.push(...messages); } },
     calls
   };
   return env;
