@@ -402,20 +402,41 @@ async function processJob(id,env){
     throw error;
   }
 }
+async function discoverIndexTickers(){
+  const screeners=["most_actives","day_gainers","day_losers","undervalued_large_caps","growth_technology_stocks","small_cap_gainers"];
+  const found=[];
+  await Promise.all(screeners.map(async scrId=>{
+    try{
+      const url=new URL("https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved");
+      url.searchParams.set("scrIds",scrId);url.searchParams.set("count","100");url.searchParams.set("start","0");
+      const response=await fetch(url,{headers:{"User-Agent":"Mozilla/5.0 FinanxResearch/1.0","Accept":"application/json"},signal:AbortSignal.timeout(9000)});
+      if(!response.ok)return;
+      const data=await response.json(),quotes=data?.finance?.result?.[0]?.quotes||[];
+      for(const quote of quotes){
+        const ticker=String(quote.symbol||"").toUpperCase();
+        if(quote.quoteType==="EQUITY"&&validTicker(ticker)&&!ticker.includes("^")&&!ticker.includes("="))found.push(ticker);
+      }
+    }catch{}
+  }));
+  return [...new Set(found)];
+}
 async function refreshIndexes(env,indexer){
-  const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cutoff=new Date(Date.now()-6*3600000).toISOString();
-  const catalog=(await all(env,"SELECT ticker FROM ticker_catalog ORDER BY COALESCE(last_indexed_at,'') ASC LIMIT 100")).map(x=>x.ticker);
-  const candidates=catalog.length?catalog:POPULAR;
+  const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cooldownHours=6,cutoff=new Date(Date.now()-cooldownHours*3600000).toISOString();
+  const discovered=await discoverIndexTickers();
+  const catalog=(await all(env,"SELECT ticker FROM ticker_catalog ORDER BY COALESCE(last_indexed_at,'') ASC LIMIT 500")).map(x=>x.ticker);
+  // Fresh market-screen discoveries always get first priority; catalog is a fallback/re-index pool.
+  const candidates=[...new Set([...discovered,...catalog,...POPULAR])];
   const batch=[];
   for(const ticker of candidates){
+    if(!validTicker(ticker))continue;
     const recent=await first(env,"SELECT indexed_at FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=? LIMIT 1",ticker,period,horizon,indexer,cutoff);
     if(recent)continue;
     const active=await first(env,"SELECT id FROM analysis_jobs WHERE ticker=? AND save_to_indexer=? AND status IN ('queued','running') LIMIT 1",ticker,indexer);
     if(active)continue;
     const id=crypto.randomUUID(),created=isoNow();
-    await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,save_to_indexer,status,created_at,updated_at,stage,progress) VALUES(?,?,?,?,?,'queued',?,?,?,0)",id,ticker,period,horizon,indexer,created,created,"Scheduled "+indexer+" refresh");
+    await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,save_to_indexer,status,created_at,updated_at,stage,progress) VALUES(?,?,?,?,?,'queued',?,?,?,0)",id,ticker,period,horizon,indexer,created,created,"Scheduled "+indexer+" discovery refresh");
     batch.push({body:{jobId:id}});
-    if(batch.length>=24)break;
+    if(batch.length>=8)break;
   }
   if(batch.length){const queue=indexer==="FullIndex"?env.FULLINDEX_QUEUE:env.ANALYSIS_QUEUE;if(!queue?.sendBatch)throw new Error(indexer+" queue binding is unavailable");await queue.sendBatch(batch);}
 }
