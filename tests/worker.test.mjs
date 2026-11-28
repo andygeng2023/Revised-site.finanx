@@ -65,6 +65,8 @@ test("serves the Finanx application and core pages", async () => {
   for (const marker of [
     "Market intelligence", "Market pulse", "Top advancing", "Top declining", "Stocks to explore",
     "Market Scan", "PreviewIndex", "FullIndex", "stock-chart", "history-chart",
+    "stock-jump-nav", "Historical price", "Volatility & trading data", "Model performance",
+    "chart-range-selected", "forecast-model-key", "model-performance-rows", "company-description",
     "home-featured-cards", "discover-featured-cards", "Forecast leaders", "Recently analysed",
     "Your saved instruments", "Shared model learning", "Analysis history", "Watchlist", "settings-grid",
     "Background processing", "Validation & limitations"
@@ -161,6 +163,38 @@ test("handles browser preflight requests without database access", async () => {
 test("unknown API routes return 404", async () => {
   const response = await worker.fetch(new Request("https://finanx.test/api/not-a-route"), {}, { waitUntil() {} });
   assert.equal(response.status, 404);
+});
+
+test("intraday stock history endpoint returns OHLCV rows for a valid range", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    chart: { result: [{
+      timestamp: [1795800000, 1795800300],
+      meta: { exchangeTimezoneName: "America/New_York", currency: "USD" },
+      indicators: { quote: [{ open: [100, 101], high: [102, 103], low: [99, 100], close: [101, 102], volume: [1000, 1200] }] }
+    }] }
+  }), { status: 200, headers: { "Content-Type": "application/json" } });
+  try {
+    const response = await worker.fetch(new Request("https://finanx.test/api/stock-history?ticker=AAPL&range=1d"), testEnv(), { waitUntil() {} });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.ticker, "AAPL");
+    assert.equal(body.interval, "5m");
+    assert.equal(body.rows.length, 2);
+    assert.equal(body.rows[0].open, 100);
+    assert.equal(body.rows[1].high, 103);
+    assert.equal(body.rows[1].volume, 1200);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("stock history endpoint rejects unsupported ranges and malformed tickers", async () => {
+  const env = testEnv();
+  const unsupported = await worker.fetch(new Request("https://finanx.test/api/stock-history?ticker=AAPL&range=3d"), env, { waitUntil() {} });
+  assert.equal(unsupported.status, 400);
+  const malformed = await worker.fetch(new Request("https://finanx.test/api/stock-history?ticker=bad%20ticker&range=1d"), env, { waitUntil() {} });
+  assert.equal(malformed.status, 400);
 });
 
 test("PreviewIndex and FullIndex have fixed 30 and 60 day horizons", async () => {
