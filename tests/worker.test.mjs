@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import worker from "../src/worker.js";
 import { getOriginalPredictions, ensemblePredictions, buildModelEvaluation, modelCandidates } from "../src/models.js";
 
-function testEnv({ firstResult = null, failDatabase = false } = {}) {
+function testEnv({ firstResult = null, failDatabase = false, failUserInsert = false } = {}) {
   const calls = { sql: [], queue: 0, batches: 0, batchMessages: [] };
   const env = {
     DB: {
@@ -25,7 +25,10 @@ function testEnv({ firstResult = null, failDatabase = false } = {}) {
                 return firstResult;
               },
               all: async () => ({ results: [] }),
-              run: async () => ({ success: true, meta: { changes: 1 } })
+              run: async () => {
+                if (failUserInsert && sql.includes("INSERT INTO users")) throw new Error("D1 daily row write limit exhausted");
+                return { success: true, meta: { changes: 1 } };
+              }
             };
           }
         };
@@ -35,6 +38,18 @@ function testEnv({ firstResult = null, failDatabase = false } = {}) {
     ANALYSIS_QUEUE: { send: async () => { calls.queue++; }, sendBatch: async messages => { calls.batchMessages.push(...messages); } },
     FULLINDEX_QUEUE: { send: async () => {}, sendBatch: async messages => { calls.batchMessages.push(...messages); } },
     PREVIEWINDEX_QUEUE: { send: async () => {}, sendBatch: async messages => { calls.batchMessages.push(...messages); } },
+    AUTH_KV: (() => {
+      const values = new Map();
+      return {
+        async get(key, type) {
+          const value = values.get(key);
+          if (value == null) return null;
+          return type === "json" ? JSON.parse(value) : value;
+        },
+        async put(key, value) { values.set(key, String(value)); },
+        async delete(key) { values.delete(key); }
+      };
+    })(),
     calls
   };
   return env;
@@ -283,4 +298,23 @@ test("Worker PBKDF2 iterations stay within the WebCrypto limit", async () => {
   const source = await readFile(new URL("../src/worker.js", import.meta.url), "utf8");
   assert.match(source, /iterations:100000,hash:"SHA-256"/);
   assert.match(source, /const dailyVol=.*\n  const rawModelSignal=.*newsAdjustment=/);
+});
+
+
+test("signup falls back to EU KV when D1 daily writes are exhausted", async () => {
+  const env = testEnv({ failUserInsert: true });
+  const response = await worker.fetch(new Request("https://finanx.test/api/auth/signup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "cf-connecting-ip": "192.0.2.222" },
+    body: JSON.stringify({ email: "fallback@example.com", password: "secure-test-password" })
+  }), env, { waitUntil() {} });
+  assert.equal(response.status, 201);
+  const body = await response.json();
+  assert.equal(body.user.email, "fallback@example.com");
+  assert.equal(body.session.token_type, "bearer");
+  const me = await worker.fetch(new Request("https://finanx.test/api/auth/me", {
+    headers: { Authorization: "Bearer " + body.session.access_token }
+  }), env, { waitUntil() {} });
+  assert.equal(me.status, 200);
+  assert.equal((await me.json()).user.email, "fallback@example.com");
 });
