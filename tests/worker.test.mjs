@@ -318,3 +318,23 @@ test("signup falls back to EU KV when D1 daily writes are exhausted", async () =
   assert.equal(me.status, 200);
   assert.equal((await me.json()).user.email, "fallback@example.com");
 });
+
+
+test("KV-backed accounts can add, list and remove watchlist items without D1 writes", async () => {
+  const env = testEnv({ failUserInsert: true });
+  const signup = await worker.fetch(new Request("https://finanx.test/api/auth/signup", {
+    method: "POST", headers: { "Content-Type": "application/json", "cf-connecting-ip": "192.0.2.223" },
+    body: JSON.stringify({ email: "watchlist-fallback@example.com", password: "secure-test-password" })
+  }), env, { waitUntil() {} });
+  assert.equal(signup.status, 201);
+  const account = await signup.json();
+  const headers = { Authorization: "Bearer " + account.session.access_token, "Content-Type": "application/json" };
+  const add = await worker.fetch(new Request("https://finanx.test/api/watchlist", { method: "POST", headers, body: JSON.stringify({ action: "add", ticker: "AAPL" }) }), env, { waitUntil() {} });
+  assert.equal(add.status, 200);
+  const listed = await worker.fetch(new Request("https://finanx.test/api/watchlist", { method: "POST", headers, body: JSON.stringify({ action: "list" }) }), env, { waitUntil() {} });
+  assert.deepEqual((await listed.json()).items.map(item => item.ticker), ["AAPL"]);
+  const removed = await worker.fetch(new Request("https://finanx.test/api/watchlist", { method: "POST", headers, body: JSON.stringify({ action: "remove", ticker: "AAPL" }) }), env, { waitUntil() {} });
+  assert.equal(removed.status, 200);
+  const finalList = await worker.fetch(new Request("https://finanx.test/api/watchlist", { method: "POST", headers, body: JSON.stringify({ action: "list" }) }), env, { waitUntil() {} });
+  assert.deepEqual((await finalList.json()).items, []);
+});
