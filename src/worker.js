@@ -677,12 +677,16 @@ async function refreshIndexesCore(env,indexer){
 
   // Recover jobs whose D1 status outlived their queue message (e.g. messages expired or a consumer crashed).
   const stale=await all(env,"SELECT id,ticker FROM analysis_jobs WHERE save_to_indexer=? AND status IN ('queued','running') AND updated_at<? ORDER BY updated_at ASC LIMIT 100",indexer,staleCutoff);
-  if(stale.length){
+  // The previous deployed model bundle contained a dailyVol temporal-dead-zone bug.
+  // Retry those failures now that the corrected bundle is live.
+  const fixedCodeFailures=await all(env,"SELECT id,ticker FROM analysis_jobs WHERE save_to_indexer=? AND status='failed' AND error LIKE '%dailyVol%' ORDER BY updated_at ASC LIMIT 100",indexer);
+  const recover=[...new Map([...stale,...fixedCodeFailures].map(job=>[job.id,job])).values()];
+  if(recover.length){
     const queue=indexer==="FullIndex"?env.FULLINDEX_QUEUE:env.PREVIEWINDEX_QUEUE;
     if(!queue?.sendBatch)throw new Error(indexer+" queue binding is unavailable during recovery");
-    const batch=stale.map(job=>({body:{jobId:job.id}}));
+    const batch=recover.map(job=>({body:{jobId:job.id}}));
     await queue.sendBatch(batch);
-    await Promise.all(stale.map(job=>run(env,"UPDATE analysis_jobs SET status='queued',progress=0,attempts=0,error=NULL,stage='Recovered stale job; requeued by scheduled scan',updated_at=? WHERE id=?",isoNow(),job.id)));
+    await Promise.all(recover.map(job=>run(env,"UPDATE analysis_jobs SET status='queued',job_type='scan',progress=0,attempts=0,error=NULL,stage='Recovered job; requeued by scheduled scan',updated_at=? WHERE id=?",isoNow(),job.id)));
   }
   const discovered=await discoverIndexTickers();
   const catalog=(await all(env,"SELECT ticker FROM ticker_catalog ORDER BY COALESCE(last_indexed_at,'') ASC LIMIT 500")).map(x=>x.ticker);
