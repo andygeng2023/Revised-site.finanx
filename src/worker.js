@@ -256,6 +256,7 @@ async function marketFeed(url,env,req){
     const searchUrl=new URL("https://query1.finance.yahoo.com/v1/finance/search");searchUrl.searchParams.set("q",q);searchUrl.searchParams.set("quotesCount","10");searchUrl.searchParams.set("newsCount","0");
     try{const r=await fetch(searchUrl,{headers:{"User-Agent":"Mozilla/5.0"},signal:AbortSignal.timeout(9000)});if(!r.ok)throw new Error("Search unavailable");const d=await r.json();return json({suggestions:(d.quotes||[]).filter(x=>x.symbol).map(x=>({symbol:x.symbol,name:x.longname||x.shortname||x.symbol,exchange:x.exchange||""}))});}catch{return json({suggestions:[]});}
   }
+  if(!await rateLimit(env,req,"market-feed",15,60000))return json({error:"Market feed refresh limit reached. Try again shortly."},429);
   const catalog=await all(env,"SELECT ticker,company,currency FROM ticker_catalog ORDER BY ticker LIMIT 60");
   const indexed=await all(env,"SELECT DISTINCT ticker FROM market_index ORDER BY ticker LIMIT 100");
   const tickers=POPULAR.concat(catalog.map(x=>x.ticker),indexed.map(x=>x.ticker)).filter((x,i,a)=>a.indexOf(x)===i).slice(0,48);
@@ -264,8 +265,8 @@ async function marketFeed(url,env,req){
       const cachedQuote=await first(env,"SELECT * FROM market_quotes WHERE ticker=? AND updated_at>=?",ticker,new Date(Date.now()-5*60000).toISOString());
       const quote=cachedQuote?{ticker,company:cachedQuote.company,currency:cachedQuote.currency,price:cachedQuote.price,change_percent:cachedQuote.change_percent,as_of:cachedQuote.as_of,history:[],source:cachedQuote.source}:await yahooChart(ticker,"1y");
       if(!cachedQuote)await run(env,"INSERT INTO market_quotes(ticker,company,currency,price,change_percent,as_of,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,price=excluded.price,change_percent=excluded.change_percent,as_of=excluded.as_of,source=excluded.source,updated_at=excluded.updated_at",ticker,quote.company,quote.currency,quote.price,quote.change_percent,quote.as_of,quote.source,isoNow());
-      const full=await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period='10y' AND horizon=30 AND indexer='FullIndex'",ticker);
-      const preview=full?null:await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period='5y' AND horizon=30 AND indexer='PreviewIndex'",ticker);
+      const full=await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period='10y' AND horizon=30 AND indexer='FullIndex' AND indexed_at>=?",ticker,new Date(Date.now()-24*3600000).toISOString());
+      const preview=full?null:await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period='5y' AND horizon=30 AND indexer='PreviewIndex' AND indexed_at>=?",ticker,new Date(Date.now()-8*3600000).toISOString());
       const row=full||preview,indexer=full?"FullIndex":preview?"PreviewIndex":null,result=parse(row?.result);
       await run(env,"INSERT INTO ticker_catalog(ticker,company,currency,last_indexed_at) VALUES(?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency",ticker,quote.company,quote.currency,row?.indexed_at||null);
       const hist=result?.history?.close||quote.history.slice(-60).map(x=>x.close);
