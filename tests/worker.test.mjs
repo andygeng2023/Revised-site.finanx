@@ -317,31 +317,22 @@ test("PreviewIndex keeps a smaller candidate set while retaining all hybrid laye
   assert.equal(candidates.filter(x => x.type === "Primary hybrid").length, 1);
 });
 
-test("scheduled index refreshes use an eight-hour cadence and remain capped at four jobs per run", async () => {
-  const envPreview = testEnv();
-  const previewPromises = [];
-  worker.scheduled({ cron: "0 */8 * * *" }, envPreview, { waitUntil: promise => previewPromises.push(promise) });
-  await Promise.all(previewPromises);
-  const previewInsert = envPreview.calls.sql.find(x => x.sql.includes("INSERT INTO analysis_jobs"));
-  assert.ok(previewInsert, "Preview schedule must enqueue index work");
-  assert.equal(previewInsert.args[4], "PreviewIndex");
-  assert.ok(envPreview.calls.batchMessages.length > 0);
-
-  const envFull = testEnv();
-  const fullPromises = [];
-  worker.scheduled({ cron: "30 */8 * * *" }, envFull, { waitUntil: promise => fullPromises.push(promise) });
-  await Promise.all(fullPromises);
-  const fullInsert = envFull.calls.sql.find(x => x.sql.includes("INSERT INTO analysis_jobs"));
-  assert.ok(fullInsert, "Full schedule must enqueue index work");
-  assert.equal(fullInsert.args[4], "FullIndex");
-  assert.ok(envFull.calls.batchMessages.length > 0);
+test("scheduled index refreshes run every five minutes for both index types", async () => {
+  const env = testEnv();
+  const promises = [];
+  worker.scheduled({ cron: "*/5 * * * *" }, env, { waitUntil: promise => promises.push(promise) });
+  assert.equal(promises.length, 2, "Both index types should be refreshed on every scan cycle");
+  await Promise.all(promises);
+  assert.ok(env.calls.sql.some(x => x.sql.includes("INSERT INTO analysis_jobs") && x.args[4] === "PreviewIndex"));
+  assert.ok(env.calls.sql.some(x => x.sql.includes("INSERT INTO analysis_jobs") && x.args[4] === "FullIndex"));
+  assert.ok(env.calls.batchMessages.length >= 2);
 });
 
 
 test("weekly housekeeping is separated from index refreshes", async () => {
   const env = testEnv();
   const promises = [];
-  worker.scheduled({ cron: "0 */8 * * *", scheduledTime: Date.UTC(2026, 10, 29, 0, 0, 0) }, env, { waitUntil: promise => promises.push(promise) });
+  worker.scheduled({ cron: "*/5 * * * *", scheduledTime: Date.UTC(2026, 10, 29, 0, 0, 0) }, env, { waitUntil: promise => promises.push(promise) });
   await Promise.all(promises);
   assert.ok(env.calls.sql.some(call => call.sql.includes("DELETE FROM sessions")));
   assert.ok(env.calls.sql.some(call => call.sql.includes("DELETE FROM analysis_jobs")));
