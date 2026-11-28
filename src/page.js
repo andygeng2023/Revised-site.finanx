@@ -259,7 +259,7 @@ body{background:radial-gradient(ellipse at 78% -18%,rgba(55,100,145,.25),transpa
 <script>
 (function(){
 "use strict";
-const API="";
+const API="https://revised-finanx.stock-analyser-2026.workers.dev";
 const $=id=>document.getElementById(id);
 const state={user:null,session:null,activePage:"home",ticker:null,index:"PreviewIndex",currentAnalysis:null,jobs:[],watchlist:[],quoteItems:[],indexStats:null,marketMeta:null,scanItems:[],learning:{PreviewIndex:null,FullIndex:null},queueStatus:null,pollTimer:null,marketTimer:null,authMode:"signin",marketLoaded:false,marketLoading:false,analysisRequest:null,loadToken:0};
 const MARKET_CACHE_KEY="finanx-market-feed-v2",SCAN_CACHE_KEY="finanx-market-scan-v2";
