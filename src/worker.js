@@ -216,7 +216,8 @@ async function analysisStatus(req,url,env){
   return json({...visible,result:parse(job.result),progress:job.status==="completed"?100:Number(job.progress||0)});
 }
 async function indexAvailability(url,env){
-  const ticker=(url.searchParams.get("ticker")||"").toUpperCase();
+  const ticker=(url.searchParams.get("ticker")||"").toUpperCase(),requestedHorizon=url.searchParams.get("horizon");
+  if(requestedHorizon!==null&&(!Number.isInteger(Number(requestedHorizon))||Number(requestedHorizon)<1||Number(requestedHorizon)>504))return json({error:"Horizon must be a whole number from 1 to 504 trading days."},400);
   if(!validTicker(ticker))return json({error:"Enter a valid ticker."},400);
   const definitions=[{id:"PreviewIndex",period:"5y",horizon:30,age:8},{id:"FullIndex",period:"10y",horizon:60,age:24}],indexes=[];
   for(const item of definitions){
