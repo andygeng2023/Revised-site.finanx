@@ -143,7 +143,7 @@ async function makeAnalysis(env,job){
   const period=indexer==="FullIndex"?"10y":(job.period||"5y");
   await run(env,"UPDATE analysis_jobs SET status='running',progress=5,stage='Downloading and validating market history',updated_at=? WHERE id=?",isoNow(),job.id);
   const quote=await yahooChart(job.ticker,period);
-  const fundamentals=await yahooFundamentals(job.ticker);
+  const fundamentals=await yahooFundamentals(job.ticker),newsContext=await getTickerNews(job.ticker);
   const rows=quote.history,closes=rows.map(x=>x.close),volumes=rows.map(x=>x.volume||0),horizon=clamp(Number(job.horizon||30),1,504);
   await run(env,"UPDATE analysis_jobs SET progress=27,stage='Evaluating chronological holdouts',updated_at=? WHERE id=?",isoNow(),job.id);
   const previousWeights=await loadGlobalWeights(env,indexer);
@@ -155,7 +155,7 @@ async function makeAnalysis(env,job){
   const original=getOriginalPredictions(closes,volumes);
   const predictions=ensemblePredictions(original.predictions,globalWeights,full);
   const candidates=modelCandidates(predictions,evaluation.stats,globalWeights);
-  const dailySignal=clamp(Number(predictions.primary||0),-0.02,0.02);
+  const rawModelSignal=clamp(Number(predictions.primary||0),-0.02,0.02),newsAdjustment=clamp(Number(newsContext.temporal.signal||0)*dailyVol*.025,-.0008,.0008),dailySignal=clamp(rawModelSignal+newsAdjustment,-0.02,0.02);
   const dailyVol=Number(original.diagnostics.volatility||0.015);
   let cumulative=0;
   const forecast=[],lower=[],upper=[];
@@ -176,7 +176,7 @@ async function makeAnalysis(env,job){
     forecast:{horizon,hybrid:forecast,lower_bound:lower,upper_bound:upper,expected_change_percent:Number(expected.toFixed(2)),model_name:"Adaptive Primary Hybrid"},
     risk:{score:Number(risk.toFixed(1)),annualized_volatility:Number((dailyVol*Math.sqrt(252)*100).toFixed(2)),recent_drawdown:Number((Number(original.diagnostics.drawdown||0)*100).toFixed(2)),rsi:Number(original.diagnostics.rsi||50).toFixed(1)},
     model:{version:modelVersion,primary:"Adaptive Primary Hybrid",original_count:full?15:7,hybrid_count:10,meta_count:3,metrics:{backtest:{directional_accuracy:Number(accuracy.toFixed(4)),validation_windows:evaluation.windows,validation_horizon:"1 trading day"}},learning_observations:candidates.reduce((sum,c)=>sum+c.observations,0),candidates},
-    fundamentals:{...fundamentals,source:"Yahoo Finance quote summary"}
+    fundamentals:{...fundamentals,source:"Yahoo Finance quote summary"},news_context:{...newsContext.temporal,items:newsContext.items,signal_adjustment:Number(newsAdjustment.toFixed(6)),method:"Simple headline keyword signal blended at a low weight; time buckets are independently weighted and this is not a trained sentiment model."}
   };
   await run(env,"UPDATE analysis_jobs SET progress=86,stage='Writing shared index and forecast',updated_at=? WHERE id=?",isoNow(),job.id);
   return result;
@@ -249,6 +249,46 @@ async function mapLimit(items,limit,mapper){
   }));
   return output;
 }
+async function fetchYahooNews(query,limit=12){
+  const url=new URL("https://query1.finance.yahoo.com/v1/finance/search");
+  url.searchParams.set("q",query);url.searchParams.set("quotesCount","0");url.searchParams.set("newsCount",String(limit));
+  const response=await fetch(url,{headers:{"User-Agent":"Mozilla/5.0 FinanxResearch/1.0","Accept":"application/json"},signal:AbortSignal.timeout(10000)});
+  if(!response.ok)throw new Error("News provider unavailable");
+  const data=await response.json();
+  const now=Date.now(),items=(data.news||[]).map(item=>{
+    const ts=Number(item.providerPublishTime||item.pubDate||item.publishedAt||0);
+    const published=ts>1e12?ts:ts*1000;
+    return {title:String(item.title||""),summary:String(item.summary||item.description||""),publisher:String(item.publisher||item.provider||"News source"),url:String(item.link||item.url||""),published_at:published?new Date(published).toISOString():null,age_hours:published?Math.max(0,(now-published)/3600000):null};
+  }).filter(item=>item.title&&item.url);
+  return items;
+}
+function newsRoute(url,env,req){
+  const query=(url.searchParams.get("q")||"market news").trim().slice(0,80);
+  return (async()=>{
+    if(!await rateLimit(env,req,"news-feed",20,60000))return json({error:"News refresh limit reached. Try again shortly."},429);
+    try{return json({items:await fetchYahooNews(query,16),query,generated_at:isoNow()});}
+    catch{return json({items:[],query,generated_at:isoNow(),unavailable:true});}
+  })();
+}
+function scoreHeadline(text){
+  const positive=/beat(s|ing)?|upgrade(d|s)?|growth|surge(d|s)?|record|profit|strong|rise(s|n)?|gain(s|ed)?|bullish|buyback|outperform|positive|expansion|approval|launch|deal|contract|dividend|improv(e|ed|ement)/i;
+  const negative=/miss(es|ed)?|downgrade(d|s)?|decline(d|s)?|drop(s|ped)?|fall(s|en)?|loss(es)?|weak|bearish|cut(s)?|warning|lawsuit|investigation|recall|layoff|risk|negative|crash|disappoint(s|ed)?|debt|fine|fraud/i;
+  const p=(String(text).match(new RegExp(positive.source,"gi"))||[]).length,n=(String(text).match(new RegExp(negative.source,"gi"))||[]).length;
+  return Math.max(-1,Math.min(1,(p-n)/Math.max(2,p+n)));
+}
+function summarizeNewsByTime(items){
+  const ranges=[{key:"0-6h",label:"Last 6 hours",min:0,max:6,weight:1},{key:"6-24h",label:"6–24 hours",min:6,max:24,weight:.8},{key:"1-3d",label:"1–3 days",min:24,max:72,weight:.55},{key:"3-7d",label:"3–7 days",min:72,max:168,weight:.3}];
+  const buckets=ranges.map(range=>{const news=items.filter(item=>item.age_hours!=null&&item.age_hours>=range.min&&item.age_hours<range.max);return {...range,count:news.length,signal:news.length?news.reduce((sum,item)=>sum+scoreHeadline(item.title+" "+item.summary),0)/news.length:0};});
+  const populated=buckets.filter(bucket=>bucket.count);
+  const weighted=populated.reduce((sum,bucket)=>sum+bucket.signal*bucket.weight* Math.min(1,bucket.count/3),0);
+  const totalWeight=populated.reduce((sum,bucket)=>sum+bucket.weight*Math.min(1,bucket.count/3),0);
+  return {buckets,signal:totalWeight?Math.max(-1,Math.min(1,weighted/totalWeight)):0,coverage:populated.length};
+}
+async function getTickerNews(ticker){
+  try{const items=await fetchYahooNews(ticker,20);return {items,temporal:summarizeNewsByTime(items)};}
+  catch{return {items:[],temporal:summarizeNewsByTime([]),unavailable:true};}
+}
+
 async function marketFeed(url,env,req){
   const q=(url.searchParams.get("q")||"").trim().slice(0,60);
   if(q){
@@ -473,6 +513,7 @@ async function handleApi(req,env,url){
   }
   if(path.startsWith("/api/auth/"))return authRoute(req,env,url);
   if(path==="/api/market-feed"&&req.method==="GET")return marketFeed(url,env,req);
+  if(path==="/api/news"&&req.method==="GET")return newsRoute(url,env,req);
   if(path==="/api/indexed-stats"&&req.method==="GET")return indexedStats(env);
   if(path==="/api/search"&&req.method==="GET")return searchRoute(url,env,req);
   if(path==="/api/model-learning"&&req.method==="GET")return modelLearning(url,env);
