@@ -84,6 +84,11 @@ async function authRoute(req,env,url){
       const existing=await env.AUTH_KV.get("user-email:"+email,"json");
       if(existing)return json({error:"An account with that email already exists."},409);
     }
+    // Fail closed if D1 cannot verify whether this address already belongs to an existing account.
+    let existingD1;
+    try{existingD1=await first(env,"SELECT id FROM users WHERE email=? COLLATE NOCASE",email);}
+    catch(error){console.error("Finanx signup duplicate check unavailable",error);return json({error:"Account registration is temporarily unavailable (AUTH-05)."},503);}
+    if(existingD1)return json({error:"An account with that email already exists."},409);
     let salt,hash,id,created;
     try{salt=hex(crypto.getRandomValues(new Uint8Array(16)));hash=await passwordHash(password,salt);id=crypto.randomUUID();created=isoNow();}
     catch(error){console.error("Finanx signup stage: password preparation",error);return json({error:"Signup failed at password preparation (AUTH-01)."},500);}
