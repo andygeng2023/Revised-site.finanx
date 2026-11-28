@@ -236,6 +236,52 @@ async function yahooChart(ticker,period){
   }
   throw lastError||new Error("Market data unavailable.");
 }
+const stockHistoryMemory = new Map();
+async function yahooChartRange(ticker,range,interval){
+  const url=new URL("https://query1.finance.yahoo.com/v8/finance/chart/"+encodeURIComponent(ticker));
+  url.searchParams.set("range",range);url.searchParams.set("interval",interval);
+  url.searchParams.set("events","div,splits");url.searchParams.set("includeAdjustedClose","true");
+  let lastError=null;
+  for(const host of ["query1.finance.yahoo.com","query2.finance.yahoo.com"]){
+    const target=url.toString().replace("query1.finance.yahoo.com",host);
+    try{
+      const response=await fetch(target,{headers:{"User-Agent":"Mozilla/5.0 FinanxResearch/1.0","Accept":"application/json"},signal:AbortSignal.timeout(14000)});
+      if(!response.ok)throw new Error("Market history provider returned "+response.status);
+      const data=await response.json(),result=data?.chart?.result?.[0];
+      if(!result)throw new Error(data?.chart?.error?.description||"No market history returned.");
+      const q=result.indicators?.quote?.[0]||{},adj=result.indicators?.adjclose?.[0]?.adjclose||[];
+      const rows=(result.timestamp||[]).map((timestamp,i)=>({
+        timestamp:Number(timestamp)*1000,
+        date:new Date(timestamp*1000).toISOString(),
+        open:q.open?.[i]??null,high:q.high?.[i]??null,low:q.low?.[i]??null,
+        close:adj[i]??q.close?.[i]??null,volume:q.volume?.[i]??null
+      })).filter(row=>Number.isFinite(row.close)&&row.close>0);
+      if(!rows.length)throw new Error("No historical prices are available for this period.");
+      return {ticker,range,interval,rows,exchange_timezone:result.meta?.exchangeTimezoneName||"UTC",currency:result.meta?.currency||"USD",source:"Yahoo Finance chart data"};
+    }catch(error){lastError=error;}
+  }
+  throw lastError||new Error("Market history unavailable.");
+}
+async function stockHistory(url){
+  const ticker=(url.searchParams.get("ticker")||"").trim().toUpperCase();
+  const range=(url.searchParams.get("range")||"1d").toLowerCase();
+  if(!validTicker(ticker))return json({error:"Enter a valid stock ticker."},400);
+  const definitions={
+    "1d":{range:"1d",interval:"5m",ttl:60},
+    "1w":{range:"5d",interval:"15m",ttl:120},
+    "max":{range:"max",interval:"1wk",ttl:3600}
+  };
+  const definition=definitions[range];
+  if(!definition)return json({error:"Unsupported historical range."},400);
+  const key=ticker+":"+range,now=Date.now(),cached=stockHistoryMemory.get(key);
+  if(cached&&now-cached.time<definition.ttl*1000)return json(cached.value,200,{"Cache-Control":"public, max-age="+Math.min(60,definition.ttl)});
+  const value=await yahooChartRange(ticker,definition.range,definition.interval);
+  stockHistoryMemory.set(key,{time:now,value});
+  if(stockHistoryMemory.size>120){
+    for(const [cacheKey,item] of stockHistoryMemory)if(now-item.time>3600000)stockHistoryMemory.delete(cacheKey);
+  }
+  return json(value,200,{"Cache-Control":"public, max-age="+Math.min(60,definition.ttl)});
+}
 async function yahooFundamentals(ticker){
   const url=new URL("https://query1.finance.yahoo.com/v10/finance/quoteSummary/"+encodeURIComponent(ticker));
   url.searchParams.set("modules","price,summaryDetail,assetProfile,defaultKeyStatistics,financialData");
@@ -244,7 +290,7 @@ async function yahooFundamentals(ticker){
     if(!response.ok)return {};
     const data=await response.json(),item=data?.quoteSummary?.result?.[0]||{};
     const raw=x=>x&&typeof x==="object"&&"raw"in x?x.raw:null;
-    return {sector:item.assetProfile?.sector||null,industry:item.assetProfile?.industry||null,market_cap:raw(item.price?.marketCap),trailing_pe:raw(item.summaryDetail?.trailingPE),forward_pe:raw(item.summaryDetail?.forwardPE),profit_margin:raw(item.financialData?.profitMargins),return_on_equity:raw(item.financialData?.returnOnEquity),dividend_yield:raw(item.summaryDetail?.dividendYield),beta:raw(item.defaultKeyStatistics?.beta),employees:item.assetProfile?.fullTimeEmployees||null,website:item.assetProfile?.website||null};
+    return {description:item.assetProfile?.longBusinessSummary||null,sector:item.assetProfile?.sector||null,industry:item.assetProfile?.industry||null,market_cap:raw(item.price?.marketCap),trailing_pe:raw(item.summaryDetail?.trailingPE),forward_pe:raw(item.summaryDetail?.forwardPE),profit_margin:raw(item.financialData?.profitMargins),return_on_equity:raw(item.financialData?.returnOnEquity),dividend_yield:raw(item.summaryDetail?.dividendYield),beta:raw(item.defaultKeyStatistics?.beta),employees:item.assetProfile?.fullTimeEmployees||null,website:item.assetProfile?.website||null,enterprise_value:raw(item.defaultKeyStatistics?.enterpriseValue),price_to_sales:raw(item.summaryDetail?.priceToSalesTrailing12Months),book_value:raw(item.defaultKeyStatistics?.bookValue),earnings_growth:raw(item.financialData?.earningsGrowth),revenue_growth:raw(item.financialData?.revenueGrowth),debt_to_equity:raw(item.financialData?.debtToEquity),current_ratio:raw(item.financialData?.currentRatio),free_cash_flow:raw(item.financialData?.freeCashflow),operating_cash_flow:raw(item.financialData?.operatingCashflow)};
   }catch{return {};}
 }
 function returnsOf(close){const r=[];for(let i=1;i<close.length;i++)if(close[i-1]>0&&close[i]>0)r.push(close[i]/close[i-1]-1);return r;}
@@ -330,7 +376,7 @@ async function makeAnalysis(env,job){
   const modelVersion=full?"finanx-full-ensemble-v2":"finanx-preview-ensemble-v2";
   const result={
     ticker:job.ticker,company:quote.company,currency:quote.currency,exchange:quote.exchange,price:quote.price,change_percent:quote.change_percent,as_of:quote.as_of,data_source:quote.source,indexed_at:isoNow(),
-    history:{period,dates:rows.slice(-2600).map(x=>x.date),close:rows.slice(-2600).map(x=>x.close),volume:rows.slice(-2600).map(x=>x.volume)},
+    history:{period,dates:rows.slice(-2600).map(x=>x.date),open:rows.slice(-2600).map(x=>x.open),high:rows.slice(-2600).map(x=>x.high),low:rows.slice(-2600).map(x=>x.low),close:rows.slice(-2600).map(x=>x.close),volume:rows.slice(-2600).map(x=>x.volume)},
     forecast:{horizon,hybrid:forecast,lower_bound:lower,upper_bound:upper,expected_change_percent:Number(expected.toFixed(2)),model_name:"Adaptive Primary Hybrid"},
     risk:{score:Number(risk.toFixed(1)),annualized_volatility:Number((dailyVol*Math.sqrt(252)*100).toFixed(2)),recent_drawdown:Number((Number(original.diagnostics.drawdown||0)*100).toFixed(2)),rsi:Number(original.diagnostics.rsi||50).toFixed(1)},
     model:{version:modelVersion,primary:"Adaptive Primary Hybrid",original_count:full?15:7,hybrid_count:10,meta_count:3,metrics:{backtest:{directional_accuracy:Number(accuracy.toFixed(4)),validation_windows:evaluation.windows,validation_horizon:"1 trading day"}},learning_observations:candidates.reduce((sum,c)=>sum+c.observations,0),candidates},
@@ -757,6 +803,7 @@ async function handleApi(req,env,url){
   if(path==="/api/analysis-status"&&req.method==="GET")return analysisStatus(req,url,env);
   if(path==="/api/index-availability"&&req.method==="GET")return indexAvailability(url,env);
   if(path==="/api/stock-market-data"&&req.method==="GET")return stockMarketData(url,env);
+  if(path==="/api/stock-history"&&req.method==="GET")return stockHistory(url);
   return json({error:"Not found."},404);
 }
 export default {
