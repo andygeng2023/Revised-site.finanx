@@ -58,7 +58,7 @@ async function authRoute(req,env,url){
   }
   if(route==="login"&&method==="POST"){
     const email=String(body.email||"").trim().toLowerCase(),password=String(body.password||"");
-    if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Email or password is incorrect."},401);
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Email or password is incorrect."},401);
     const row=await first(env,"SELECT * FROM users WHERE email=? COLLATE NOCASE",email);
     if(!row||await passwordHash(password,row.password_salt)!==row.password_hash)return json({error:"Email or password is incorrect."},401);
     const signed=isoNow();await run(env,"UPDATE users SET last_sign_in_at=? WHERE id=?",signed,row.id);
