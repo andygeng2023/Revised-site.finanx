@@ -492,7 +492,7 @@ export default {
   },
   async scheduled(controller,env,ctx){
     const cron=controller.cron||"";
-    if(cron==="0 2 * * *")ctx.waitUntil(refreshIndexes(env,"FullIndex"));
+    if(cron==="1-59/2 * * * *")ctx.waitUntil(refreshIndexes(env,"FullIndex"));
     else ctx.waitUntil(refreshIndexes(env,"PreviewIndex"));
     ctx.waitUntil(run(env,"DELETE FROM sessions WHERE expires_at<?",isoNow()));
     ctx.waitUntil(run(env,"DELETE FROM analysis_jobs WHERE status IN ('completed','failed') AND updated_at<?",new Date(Date.now()-14*86400000).toISOString()));
