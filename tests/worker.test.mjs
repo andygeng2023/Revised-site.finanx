@@ -79,6 +79,26 @@ test("all static browser event-listener targets exist in the HTML", async () => 
   assert.deepEqual(missing, [], "Static event-listener targets must exist; generated targets should use explicit guards");
 });
 
+test("login rejects malformed email addresses before credential lookup", async () => {
+  const env = testEnv();
+  const response = await worker.fetch(new Request("https://finanx.test/api/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: "not a valid email", password: "long-enough-password" })
+  }), env, { waitUntil() {} });
+  assert.equal(response.status, 401);
+  assert.equal(env.calls.sql.some(x => x.sql.includes("FROM users")), false);
+});
+
+test("login accepts a valid email format and reaches credential lookup", async () => {
+  const env = testEnv();
+  const response = await worker.fetch(new Request("https://finanx.test/api/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: "person@example.com", password: "long-enough-password" })
+  }), env, { waitUntil() {} });
+  assert.equal(response.status, 401);
+  assert.equal(env.calls.sql.some(x => x.sql.includes("FROM users")), true);
+});
+
 test("health endpoint verifies database and queue bindings", async () => {
   const env = testEnv();
   const response = await worker.fetch(new Request("https://finanx.test/api/health"), env, { waitUntil() {} });
