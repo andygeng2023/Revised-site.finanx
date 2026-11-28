@@ -4,7 +4,9 @@
   "main": "src/worker.js",
   "compatibility_date": "2026-11-27",
   "workers_dev": true,
-  "observability": { "enabled": true },
+  "observability": {
+    "enabled": true
+  },
   "d1_databases": [
     {
       "binding": "DB",
@@ -14,9 +16,18 @@
   ],
   "queues": {
     "producers": [
-      { "binding": "ANALYSIS_QUEUE", "queue": "revised-finanx-analysis" },
-      { "binding": "FULLINDEX_QUEUE", "queue": "revised-finanx-fullindex" },
-      { "binding": "PREVIEWINDEX_QUEUE", "queue": "revised-finanx-previewindex" }
+      {
+        "binding": "ANALYSIS_QUEUE",
+        "queue": "revised-finanx-analysis"
+      },
+      {
+        "binding": "FULLINDEX_QUEUE",
+        "queue": "revised-finanx-fullindex"
+      },
+      {
+        "binding": "PREVIEWINDEX_QUEUE",
+        "queue": "revised-finanx-previewindex"
+      }
     ],
     "consumers": [
       {
@@ -46,6 +57,9 @@
     ]
   },
   "triggers": {
-    "crons": ["*/2 * * * *", "1-59/2 * * * *"]
+    "crons": [
+      "0 */6 * * *",
+      "30 */6 * * *"
+    ]
   }
 }
