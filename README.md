@@ -81,7 +81,7 @@ The existing Worker is configured with D1 binding `DB`, queue producer `ANALYSIS
 
 https://revised-finanx.stock-analyser-2026.workers.dev
 
-The Worker is not currently attached to `site.finanx.is-a-fullstack.dev`. That custom hostname requires the relevant DNS zone to be managed in the same Cloudflare account.
+The Cloudflare Workers `workers.dev` hostname above is the application's deployed address.
 
 ## Limitations
 
