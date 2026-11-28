@@ -638,20 +638,23 @@ async function discoverIndexTickers(){
   return [...new Set(found)];
 }
 async function refreshIndexes(env,indexer){
-  const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString();
+  const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString(),MAX_INDEXED=30000;
   const discovered=await discoverIndexTickers();
   const catalog=(await all(env,"SELECT ticker FROM ticker_catalog ORDER BY COALESCE(last_indexed_at,'') ASC LIMIT 500")).map(x=>x.ticker);
-  const [recentRows,activeRows]=await Promise.all([
+  const [recentRows,activeRows,allIndexedRows]=await Promise.all([
     all(env,"SELECT ticker FROM market_index WHERE period=? AND horizon=? AND indexer=? AND indexed_at>=?",period,horizon,indexer,cutoff),
-    all(env,"SELECT ticker FROM analysis_jobs WHERE save_to_indexer=? AND status IN ('queued','running')",indexer)
+    all(env,"SELECT ticker FROM analysis_jobs WHERE save_to_indexer=? AND status IN ('queued','running')",indexer),
+    all(env,"SELECT DISTINCT ticker FROM market_index WHERE indexer=?",indexer)
   ]);
-  const recentTickers=new Set(recentRows.map(row=>row.ticker)),activeTickers=new Set(activeRows.map(row=>row.ticker));
+  const recentTickers=new Set(recentRows.map(row=>row.ticker)),activeTickers=new Set(activeRows.map(row=>row.ticker)),indexedTickers=new Set(allIndexedRows.map(row=>row.ticker));
   const candidates=[...new Set([...discovered,...catalog,...POPULAR])],batch=[];
   for(const ticker of candidates){
     if(!validTicker(ticker)||recentTickers.has(ticker)||activeTickers.has(ticker))continue;
+    // Existing expired entries can refresh; only new distinct tickers count against the 30,000 cap.
+    if(!indexedTickers.has(ticker)&&indexedTickers.size>=MAX_INDEXED)continue;
     const id=crypto.randomUUID(),created=isoNow();
-    await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,save_to_indexer,status,created_at,updated_at,stage,progress) VALUES(?,?,?,?,?,'queued',?,?,?,0)",id,ticker,period,horizon,indexer,created,created,"Scheduled "+indexer+" discovery refresh");
-    activeTickers.add(ticker);batch.push({body:{jobId:id}});
+    await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,save_to_indexer,status,created_at,updated_at,stage,progress) VALUES(?,?,?,?,?,'queued',?,?,?,0)",id,ticker,period,horizon,indexer,created,created,"Scheduled "+indexer+" continuous discovery refresh");
+    activeTickers.add(ticker);indexedTickers.add(ticker);batch.push({body:{jobId:id}});
     if(batch.length>=4)break;
   }
   if(batch.length){const queue=indexer==="FullIndex"?env.FULLINDEX_QUEUE:env.PREVIEWINDEX_QUEUE;if(!queue?.sendBatch)throw new Error(indexer+" queue binding is unavailable");await queue.sendBatch(batch);}
@@ -731,9 +734,10 @@ export default {
   },
   async scheduled(controller,env,ctx){
     const cron=controller.cron||"";
-    if(cron==="30 */8 * * *")ctx.waitUntil(refreshIndexes(env,"FullIndex"));
-    if(cron==="0 */8 * * *"){
+    if(cron==="*/5 * * * *"){
+      // Continuously discover and queue eligible stocks; each index type has its own 30,000 cap.
       ctx.waitUntil(refreshIndexes(env,"PreviewIndex"));
+      ctx.waitUntil(refreshIndexes(env,"FullIndex"));
       const scheduledAt=new Date(Number(controller.scheduledTime||Date.now()));
       // The PreviewIndex cron also runs at Sunday 00:00 UTC; do housekeeping there
       // instead of adding another cron trigger and another scheduled invocation.
