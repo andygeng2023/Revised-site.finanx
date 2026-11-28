@@ -253,35 +253,81 @@ async function marketFeed(url,env,req){
   const q=(url.searchParams.get("q")||"").trim().slice(0,60);
   if(q){
     if(!await rateLimit(env,req,"market-search",45,60000))return json({error:"Search limit reached. Try again shortly."},429);
-    const searchUrl=new URL("https://query1.finance.yahoo.com/v1/finance/search");searchUrl.searchParams.set("q",q);searchUrl.searchParams.set("quotesCount","10");searchUrl.searchParams.set("newsCount","0");
-    try{const r=await fetch(searchUrl,{headers:{"User-Agent":"Mozilla/5.0"},signal:AbortSignal.timeout(9000)});if(!r.ok)throw new Error("Search unavailable");const d=await r.json();return json({suggestions:(d.quotes||[]).filter(x=>x.symbol).map(x=>({symbol:x.symbol,name:x.longname||x.shortname||x.symbol,exchange:x.exchange||""}))});}catch{return json({suggestions:[]});}
+    const searchUrl=new URL("https://query1.finance.yahoo.com/v1/finance/search");
+    searchUrl.searchParams.set("q",q);searchUrl.searchParams.set("quotesCount","10");searchUrl.searchParams.set("newsCount","0");
+    try{
+      const response=await fetch(searchUrl,{headers:{"User-Agent":"Mozilla/5.0"},signal:AbortSignal.timeout(9000)});
+      if(!response.ok)throw new Error("Search unavailable");
+      const data=await response.json();
+      return json({suggestions:(data.quotes||[]).filter(x=>x.symbol).map(x=>({symbol:x.symbol,name:x.longname||x.shortname||x.symbol,exchange:x.exchange||""}))});
+    }catch{return json({suggestions:[]});}
   }
+
   if(!await rateLimit(env,req,"market-feed",15,60000))return json({error:"Market feed refresh limit reached. Try again shortly."},429);
+
+  // Keep the universe bounded so even a provider fallback stays within Worker subrequest limits.
   const catalog=await all(env,"SELECT ticker,company,currency FROM ticker_catalog ORDER BY ticker LIMIT 60");
-  const indexed=await all(env,"SELECT DISTINCT ticker FROM market_index ORDER BY ticker LIMIT 100");
-  const tickers=POPULAR.concat(catalog.map(x=>x.ticker),indexed.map(x=>x.ticker)).filter((x,i,a)=>a.indexOf(x)===i).slice(0,48);
-  const items=await mapLimit(tickers.slice(0,48),6,async ticker=>{
-    const catalogItem=catalog.find(x=>x.ticker===ticker)||null;
-    const cachedQuote=await first(env,"SELECT * FROM market_quotes WHERE ticker=? AND updated_at>=?",ticker,new Date(Date.now()-5*60000).toISOString());
-    let quote=cachedQuote?{ticker,company:cachedQuote.company,currency:cachedQuote.currency,price:cachedQuote.price,change_percent:cachedQuote.change_percent,as_of:cachedQuote.as_of,history:[],source:cachedQuote.source}:null;
-    if(!quote){
-      try{
-        quote=await yahooChart(ticker,"1y");
-        await run(env,"INSERT INTO market_quotes(ticker,company,currency,price,change_percent,as_of,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,price=excluded.price,change_percent=excluded.change_percent,as_of=excluded.as_of,source=excluded.source,updated_at=excluded.updated_at",ticker,quote.company,quote.currency,quote.price,quote.change_percent,quote.as_of,quote.source,isoNow());
-      }catch{
-        quote={ticker,company:catalogItem?.company||ticker,currency:catalogItem?.currency||"USD",price:null,change_percent:null,as_of:null,history:[],source:"Quote temporarily unavailable"};
-      }
+  const indexedTickers=await all(env,"SELECT DISTINCT ticker FROM market_index ORDER BY ticker LIMIT 100");
+  const tickers=POPULAR.concat(catalog.map(x=>x.ticker),indexedTickers.map(x=>x.ticker))
+    .filter((ticker,index,items)=>validTicker(ticker)&&items.indexOf(ticker)===index).slice(0,24);
+  if(!tickers.length)return json({items:[],generated_at:isoNow(),index_counts:{PreviewIndex:0,FullIndex:0}});
+
+  const placeholders=tickers.map(()=>"?").join(",");
+  const [quoteRows,indexRows]=await Promise.all([
+    all(env,"SELECT * FROM market_quotes WHERE ticker IN ("+placeholders+")",...tickers),
+    all(env,"SELECT ticker,period,indexer,indexed_at,result FROM market_index WHERE ticker IN ("+placeholders+") AND horizon=30 AND ((indexer='FullIndex' AND indexed_at>=?) OR (indexer='PreviewIndex' AND indexed_at>=?)) ORDER BY indexed_at DESC",...tickers,new Date(Date.now()-24*3600000).toISOString(),new Date(Date.now()-8*3600000).toISOString())
+  ]);
+  const quotesByTicker=new Map(quoteRows.map(row=>[row.ticker,row]));
+  const catalogByTicker=new Map(catalog.map(row=>[row.ticker,row]));
+  const indexesByTicker=new Map();
+  for(const row of indexRows){
+    const existing=indexesByTicker.get(row.ticker);
+    if(!existing||(row.indexer==="FullIndex"&&existing.indexer!=="FullIndex")||
+      (row.indexer===existing.indexer&&row.indexed_at>existing.indexed_at))indexesByTicker.set(row.ticker,row);
+  }
+
+  const refreshed=await mapLimit(tickers,6,async ticker=>{
+    const cached=quotesByTicker.get(ticker)||null;
+    const cacheFresh=cached&&Date.now()-Date.parse(cached.updated_at||"")<5*60000;
+    if(cacheFresh)return {ticker,quote:cached};
+    try{
+      const quote=await yahooChart(ticker,"1y");
+      return {ticker,quote};
+    }catch{
+      // Prefer an explicitly timestamped cached quote over dropping a still-useful index result.
+      return {ticker,quote:cached||{ticker,company:catalogByTicker.get(ticker)?.company||ticker,currency:catalogByTicker.get(ticker)?.currency||"USD",price:null,change_percent:null,as_of:null,source:"Quote temporarily unavailable"}};
     }
-    const full=await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period='10y' AND horizon=30 AND indexer='FullIndex' AND indexed_at>=?",ticker,new Date(Date.now()-24*3600000).toISOString());
-    const preview=full?null:await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period='5y' AND horizon=30 AND indexer='PreviewIndex' AND indexed_at>=?",ticker,new Date(Date.now()-8*3600000).toISOString());
-    const row=full||preview,indexer=full?"FullIndex":preview?"PreviewIndex":null,result=parse(row?.result);
-    if(quote.company)await run(env,"INSERT INTO ticker_catalog(ticker,company,currency,last_indexed_at) VALUES(?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency",ticker,quote.company,quote.currency||"USD",row?.indexed_at||null);
-    const hist=result?.history?.close||(quote.history||[]).slice(-60).map(x=>x.close);
-    return {ticker,company:quote.company||ticker,currency:quote.currency||"USD",price:quote.price??null,change_percent:quote.change_percent??null,as_of:quote.as_of||null,indexer,indexed_at:row?.indexed_at||null,history_preview:hist.slice(-45),forecast_preview:result?.forecast?.hybrid?.slice(0,30)||[],expected_change_percent:result?.forecast?.expected_change_percent??null,source:(quote.source||"Yahoo Finance")+(row?" + shared index":"")};
+  });
+
+  const now=isoNow(),statements=[];
+  for(const item of refreshed){
+    const quote=item.quote;
+    if(quote.price!=null&&quote.company){
+      statements.push(stmt(env,"INSERT INTO market_quotes(ticker,company,currency,price,change_percent,as_of,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,price=excluded.price,change_percent=excluded.change_percent,as_of=excluded.as_of,source=excluded.source,updated_at=excluded.updated_at",item.ticker,quote.company,quote.currency||"USD",quote.price,quote.change_percent??null,quote.as_of||null,quote.source||"Yahoo Finance chart data",now));
+    }
+    const indexed=indexesByTicker.get(item.ticker);
+    if(quote.company){
+      statements.push(stmt(env,"INSERT INTO ticker_catalog(ticker,company,currency,last_indexed_at) VALUES(?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,last_indexed_at=COALESCE(excluded.last_indexed_at,ticker_catalog.last_indexed_at)",item.ticker,quote.company,quote.currency||"USD",indexed?.indexed_at||null));
+    }
+  }
+  if(statements.length)await env.DB.batch(statements);
+
+  const items=refreshed.map(({ticker,quote})=>{
+    const indexed=indexesByTicker.get(ticker),analysis=parse(indexed?.result);
+    const history=analysis?.history?.close||(quote.history||[]).slice(-60).map(row=>row.close);
+    return {
+      ticker,company:quote.company||ticker,currency:quote.currency||"USD",
+      price:quote.price??null,change_percent:quote.change_percent??null,as_of:quote.as_of||null,
+      indexer:indexed?.indexer||null,indexed_at:indexed?.indexed_at||null,
+      history_preview:history.slice(-45),
+      forecast_preview:analysis?.forecast?.hybrid?.slice(0,30)||[],
+      expected_change_percent:analysis?.forecast?.expected_change_percent??null,
+      source:(quote.source||"Yahoo Finance")+(indexed?" + shared index":"")
+    };
   });
   const counts={PreviewIndex:0,FullIndex:0};
-  for(const x of items)if(x.indexer)counts[x.indexer]++;
-  return json({items,generated_at:isoNow(),index_counts:counts});
+  for(const item of items)if(item.indexer)counts[item.indexer]++;
+  return json({items,generated_at:now,index_counts:counts});
 }
 async function watchlist(req,env){
   const user=await authUser(req,env);if(!user)return json({error:"Sign in to use your watchlist."},401);
