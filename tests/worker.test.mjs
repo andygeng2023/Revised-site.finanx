@@ -85,7 +85,7 @@ test("embedded browser JavaScript parses and has no duplicate HTML IDs", async (
   assert.ok(script, "The application script must exist");
   assert.doesNotThrow(() => new vm.Script(script), "Browser JavaScript must parse before deployment");
   const markup = html.slice(0, html.indexOf("<script>"));
-  const ids = [...markup.matchAll(/id="([^"]+)"/g)].map(match => match[1]);
+  const ids = [...markup.matchAll(/\sid="([^"]+)"/g)].map(match => match[1]);
   assert.equal(new Set(ids).size, ids.length, "HTML IDs must be unique");
   const indexHtml = await readFile(new URL("../index.html", import.meta.url), "utf8");
   for (const marker of ["home-featured-cards", "discover-featured-cards", "home-scan-picks", "settings-grid"]) {
@@ -99,7 +99,7 @@ test("all static browser event-listener targets exist in the HTML", async () => 
   const html = await response.text();
   const body = html.slice(html.indexOf("<body>"), html.indexOf("<script>"));
   const script = html.split("<script>")[1]?.split("</script>")[0] || "";
-  const ids = new Set([...body.matchAll(/id="([^"]+)"/g)].map(match => match[1]));
+  const ids = new Set([...body.matchAll(/\sid="([^"]+)"/g)].map(match => match[1]));
   const eventTargets = [...script.matchAll(/\$\("([^"]+)"\)\.addEventListener/g)].map(match => match[1]);
   const missing = [...new Set(eventTargets.filter(id => !ids.has(id)))];
   assert.deepEqual(missing, [], "Static event-listener targets must exist; generated targets should use explicit guards");
