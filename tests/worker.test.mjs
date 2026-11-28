@@ -338,7 +338,7 @@ test("PreviewIndex keeps a smaller candidate set while retaining all hybrid laye
 test("scheduled index refreshes run every five minutes for both index types", async () => {
   const env = testEnv();
   const promises = [];
-  worker.scheduled({ cron: "*/5 * * * *" }, env, { waitUntil: promise => promises.push(promise) });
+  await worker.scheduled({ cron: "*/5 * * * *" }, env, { waitUntil: promise => promises.push(promise) });
   assert.equal(promises.length, 2, "Both index types should be refreshed on every scan cycle");
   await Promise.all(promises);
   assert.ok(env.calls.sql.some(x => x.sql.includes("INSERT INTO analysis_jobs") && x.args[5] === "PreviewIndex"));
@@ -350,7 +350,7 @@ test("scheduled index refreshes run every five minutes for both index types", as
 test("weekly housekeeping is separated from index refreshes", async () => {
   const env = testEnv();
   const promises = [];
-  worker.scheduled({ cron: "*/5 * * * *", scheduledTime: Date.UTC(2026, 10, 29, 0, 0, 0) }, env, { waitUntil: promise => promises.push(promise) });
+  await worker.scheduled({ cron: "*/5 * * * *", scheduledTime: Date.UTC(2026, 10, 29, 0, 0, 0) }, env, { waitUntil: promise => promises.push(promise) });
   await Promise.all(promises);
   assert.ok(env.calls.sql.some(call => call.sql.includes("DELETE FROM sessions")));
   assert.ok(env.calls.sql.some(call => call.sql.includes("DELETE FROM analysis_jobs")));
