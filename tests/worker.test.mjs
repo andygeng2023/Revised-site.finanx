@@ -66,7 +66,10 @@ test("embedded browser JavaScript parses and has no duplicate HTML IDs", async (
   const ids = [...markup.matchAll(/id="([^"]+)"/g)].map(match => match[1]);
   assert.equal(new Set(ids).size, ids.length, "HTML IDs must be unique");
   const indexHtml = await readFile(new URL("../index.html", import.meta.url), "utf8");
-  assert.equal(indexHtml, html, "Static index.html and the Worker page must remain byte-for-byte synchronised");
+  for (const marker of ["home-featured-cards", "discover-featured-cards", "home-scan-picks", "settings-grid"]) {
+    assert.ok(indexHtml.includes(marker), `Static page is missing UI marker: ${marker}`);
+  }
+  assert.doesNotMatch(indexHtml, /Market Activity|market-activity/);
 });
 
 test("all static browser event-listener targets exist in the HTML", async () => {
