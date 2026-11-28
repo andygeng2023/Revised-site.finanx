@@ -58,6 +58,7 @@ async function authRoute(req,env,url){
   }
   if(route==="login"&&method==="POST"){
     const email=String(body.email||"").trim().toLowerCase(),password=String(body.password||"");
+    if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Email or password is incorrect."},401);
     const row=await first(env,"SELECT * FROM users WHERE email=? COLLATE NOCASE",email);
     if(!row||await passwordHash(password,row.password_salt)!==row.password_hash)return json({error:"Email or password is incorrect."},401);
     const signed=isoNow();await run(env,"UPDATE users SET last_sign_in_at=? WHERE id=?",signed,row.id);
@@ -75,9 +76,12 @@ async function authRoute(req,env,url){
   if(route==="password"&&method==="PATCH"){
     const user=await authUser(req,env);if(!user)return json({error:"Sign in again."},401);
     const password=String(body.password||"");if(password.length<8||password.length>256)return json({error:"Password must contain at least 8 characters."},400);
-    const salt=hex(crypto.getRandomValues(new Uint8Array(16))),hash=await passwordHash(password,salt);
-    await run(env,"UPDATE users SET password_hash=?,password_salt=? WHERE id=?",hash,salt,user.id);
-    return json({success:true});
+    const salt=hex(crypto.getRandomValues(new Uint8Array(16))),hash=await passwordHash(password,salt),tokenHash=await sha(tokenFrom(req));
+    await env.DB.batch([
+      stmt(env,"UPDATE users SET password_hash=?,password_salt=? WHERE id=?",hash,salt,user.id),
+      stmt(env,"DELETE FROM sessions WHERE user_id=? AND token_hash<>?",user.id,tokenHash)
+    ]);
+    return json({success:true,sessions_revoked:true});
   }
   return json({error:"Not found."},404);
 }
@@ -183,43 +187,52 @@ async function enqueueJob(env,job){
 async function requestAnalysis(req,env){
   const body=await req.json().catch(()=>({})),ticker=String(body.ticker||"").trim().toUpperCase(),indexer=String(body.save_to_indexer||body.indexer||"PreviewIndex").toLowerCase()==="fullindex"?"FullIndex":"PreviewIndex";
   if(!validTicker(ticker))return json({error:"Enter a valid stock ticker."},400);
+  const period=indexer==="FullIndex"?"10y":"5y",horizon=Number(body.horizon??30),maxAge=indexer==="FullIndex"?24:8,hardRescan=body.hard_rescan===true;
+  if(!Number.isInteger(horizon)||horizon<1||horizon>504)return json({error:"Horizon must be a whole number from 1 to 504 trading days."},400);
   if(!await rateLimit(env,req,"analysis-request",90,3600000))return json({error:"Analysis request limit reached for this connection. Try later."},429);
-  const period=indexer==="FullIndex"?"10y":"5y",horizon=clamp(Number(body.horizon||30),1,504),maxAge=indexer==="FullIndex"?24:8,cutoff=new Date(Date.now()-maxAge*3600000).toISOString();
-  if(!body.hard_rescan){
+  const cutoff=new Date(Date.now()-maxAge*3600000).toISOString();
+  if(!hardRescan){
     const cached=await first(env,"SELECT result,indexed_at,source_job_id FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=? LIMIT 1",ticker,period,horizon,indexer,cutoff);
     if(cached?.result)return json({status:"completed",ticker,indexer,cached:true,result:parse(cached.result),id:cached.source_job_id,progress:100,stage:"Loaded shared index"});
   }
   const active=await first(env,"SELECT id,status,progress,stage FROM analysis_jobs WHERE ticker=? AND period=? AND horizon=? AND save_to_indexer=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1",ticker,period,horizon,indexer);
   if(active)return json({...active,ticker,indexer,reused:true},202);
   const user=await authUser(req,env),id=crypto.randomUUID(),created=isoNow();
-  await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,job_type,scan_source,save_to_indexer,status,created_at,updated_at,progress,stage,user_id) VALUES(?,?,?,?,'analysis','both',?,'queued',?,?,0,'Waiting for analysis worker',?)",id,ticker,period,horizon,indexer,created,created,user?.id||null);
+  await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,job_type,scan_source,save_to_indexer,status,created_at,updated_at,progress,stage,user_id) VALUES(?,?,?,?,?,'both',?,'queued',?,?,0,'Waiting for analysis worker',?)",id,ticker,period,horizon,hardRescan?"hard_rescan":"analysis",indexer,created,created,user?.id||null);
   try{await enqueueJob(env,{id});}
   catch(error){await run(env,"UPDATE analysis_jobs SET status='failed',error=?,updated_at=?,stage='Could not reach the analysis queue' WHERE id=?",String(error.message||error),isoNow(),id);return json({error:"The analysis queue is temporarily unavailable."},503);}
   return json({id,status:"queued",ticker,indexer,period,horizon,progress:0,stage:"Waiting for analysis worker"},202);
 }
-async function analysisStatus(url,env){
+async function analysisStatus(req,url,env){
   const id=url.searchParams.get("id")||"";
   if(!/^[0-9a-f-]{36}$/i.test(id))return json({error:"Invalid job identifier."},400);
-  const job=await first(env,"SELECT id,ticker,status,result,error,created_at,updated_at,progress,stage,attempts,period,horizon,save_to_indexer FROM analysis_jobs WHERE id=?",id);
+  const job=await first(env,"SELECT id,ticker,status,result,error,created_at,updated_at,progress,stage,attempts,period,horizon,save_to_indexer,user_id FROM analysis_jobs WHERE id=?",id);
   if(!job)return json({error:"Analysis job not found."},404);
-  return json({...job,result:parse(job.result),progress:job.status==="completed"?100:Number(job.progress||0)});
+  if(job.user_id){
+    const user=await authUser(req,env);
+    if(!user||user.id!==job.user_id)return json({error:"Analysis job not found."},404);
+  }
+  const {user_id,...visible}=job;
+  return json({...visible,result:parse(job.result),progress:job.status==="completed"?100:Number(job.progress||0)});
 }
 async function indexAvailability(url,env){
-  const ticker=(url.searchParams.get("ticker")||"").toUpperCase();
+  const ticker=(url.searchParams.get("ticker")||"").toUpperCase(),horizon=Number(url.searchParams.get("horizon")||30);
   if(!validTicker(ticker))return json({error:"Enter a valid ticker."},400);
+  if(!Number.isInteger(horizon)||horizon<1||horizon>504)return json({error:"Horizon must be a whole number from 1 to 504 trading days."},400);
   const definitions=[{id:"PreviewIndex",period:"5y",age:8},{id:"FullIndex",period:"10y",age:24}],indexes=[];
   for(const item of definitions){
     const cutoff=new Date(Date.now()-item.age*3600000).toISOString();
-    const row=await first(env,"SELECT indexed_at FROM market_index WHERE ticker=? AND period=? AND horizon=30 AND indexer=? AND indexed_at>=?",ticker,item.period,item.id,cutoff);
+    const row=await first(env,"SELECT indexed_at FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=?",ticker,item.period,horizon,item.id,cutoff);
     if(row)indexes.push({id:item.id,label:item.id,indexed_at:row.indexed_at});
   }
-  return json({ticker,indexes,available:indexes.map(x=>x.id),checked_at:isoNow()});
+  return json({ticker,horizon,indexes,available:indexes.map(x=>x.id),checked_at:isoNow()});
 }
 async function stockMarketData(url,env){
-  const ticker=(url.searchParams.get("ticker")||"").toUpperCase(),indexer=(url.searchParams.get("indexer")||"PreviewIndex")==="FullIndex"?"FullIndex":"PreviewIndex";
+  const ticker=(url.searchParams.get("ticker")||"").toUpperCase(),indexer=(url.searchParams.get("indexer")||"PreviewIndex")==="FullIndex"?"FullIndex":"PreviewIndex",horizon=Number(url.searchParams.get("horizon")||30);
   if(!validTicker(ticker))return json({error:"Enter a valid ticker."},400);
+  if(!Number.isInteger(horizon)||horizon<1||horizon>504)return json({error:"Horizon must be a whole number from 1 to 504 trading days."},400);
   const period=indexer==="FullIndex"?"10y":"5y";
-  const row=await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period=? AND horizon=30 AND indexer=?",ticker,period,indexer);
+  const row=await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=?",ticker,period,horizon,indexer);
   if(!row)return json({analysis:null,indexer,available:false},404);
   return json({analysis:parse(row.result),indexer,indexed_at:row.indexed_at,available:true});
 }
@@ -229,33 +242,94 @@ async function indexedStats(env){
   const tracked=await first(env,"SELECT COUNT(DISTINCT ticker) AS tickers FROM ticker_catalog");
   return json({tracked:Number(tracked?.tickers||0),preview:{tickers:Number(preview?.tickers||0),records:Number(preview?.records||0),latest:preview?.latest||null},full:{tickers:Number(full?.tickers||0),records:Number(full?.records||0),latest:full?.latest||null},generated_at:isoNow()});
 }
-async function marketFeed(url,env){
+async function mapLimit(items,limit,mapper){
+  const output=new Array(items.length);let cursor=0;
+  await Promise.all(Array.from({length:Math.min(limit,items.length)},async()=>{
+    while(true){const index=cursor++;if(index>=items.length)return;output[index]=await mapper(items[index],index);}
+  }));
+  return output;
+}
+async function marketFeed(url,env,req){
   const q=(url.searchParams.get("q")||"").trim().slice(0,60);
   if(q){
-    const searchUrl=new URL("https://query1.finance.yahoo.com/v1/finance/search");searchUrl.searchParams.set("q",q);searchUrl.searchParams.set("quotesCount","10");searchUrl.searchParams.set("newsCount","0");
-    try{const r=await fetch(searchUrl,{headers:{"User-Agent":"Mozilla/5.0"},signal:AbortSignal.timeout(9000)});if(!r.ok)throw new Error("Search unavailable");const d=await r.json();return json({suggestions:(d.quotes||[]).filter(x=>x.symbol).map(x=>({symbol:x.symbol,name:x.longname||x.shortname||x.symbol,exchange:x.exchange||""}))});}catch{return json({suggestions:[]});}
-  }
-  const catalog=await all(env,"SELECT ticker,company,currency FROM ticker_catalog ORDER BY ticker LIMIT 60");
-  const indexed=await all(env,"SELECT DISTINCT ticker FROM market_index ORDER BY ticker LIMIT 100");
-  const tickers=POPULAR.concat(catalog.map(x=>x.ticker),indexed.map(x=>x.ticker)).filter((x,i,a)=>a.indexOf(x)===i).slice(0,48);
-  const items=await Promise.all(tickers.slice(0,48).map(async ticker=>{
+    if(!await rateLimit(env,req,"market-search",45,60000))return json({error:"Search limit reached. Try again shortly."},429);
+    const searchUrl=new URL("https://query1.finance.yahoo.com/v1/finance/search");
+    searchUrl.searchParams.set("q",q);searchUrl.searchParams.set("quotesCount","10");searchUrl.searchParams.set("newsCount","0");
     try{
-      const cachedQuote=await first(env,"SELECT * FROM market_quotes WHERE ticker=? AND updated_at>=?",ticker,new Date(Date.now()-5*60000).toISOString());
-      const quote=cachedQuote?{ticker,company:cachedQuote.company,currency:cachedQuote.currency,price:cachedQuote.price,change_percent:cachedQuote.change_percent,as_of:cachedQuote.as_of,history:[],source:cachedQuote.source}:await yahooChart(ticker,"1y");
-      if(!cachedQuote)await run(env,"INSERT INTO market_quotes(ticker,company,currency,price,change_percent,as_of,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,price=excluded.price,change_percent=excluded.change_percent,as_of=excluded.as_of,source=excluded.source,updated_at=excluded.updated_at",ticker,quote.company,quote.currency,quote.price,quote.change_percent,quote.as_of,quote.source,isoNow());
-      const full=await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period='10y' AND horizon=30 AND indexer='FullIndex'",ticker);
-      const preview=full?null:await first(env,"SELECT result,indexed_at FROM market_index WHERE ticker=? AND period='5y' AND horizon=30 AND indexer='PreviewIndex'",ticker);
-      const row=full||preview,indexer=full?"FullIndex":preview?"PreviewIndex":null,result=parse(row?.result);
-      await run(env,"INSERT INTO ticker_catalog(ticker,company,currency,last_indexed_at) VALUES(?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency",ticker,quote.company,quote.currency,row?.indexed_at||null);
-      const hist=result?.history?.close||quote.history.slice(-60).map(x=>x.close);
-      return {ticker,company:quote.company,currency:quote.currency,price:quote.price,change_percent:quote.change_percent,indexer,indexed_at:row?.indexed_at||null,history_preview:hist.slice(-45),forecast_preview:result?.forecast?.hybrid?.slice(0,30)||[],expected_change_percent:result?.forecast?.expected_change_percent??null,source:"Yahoo Finance"+(row?" + shared index":"")};
+      const response=await fetch(searchUrl,{headers:{"User-Agent":"Mozilla/5.0"},signal:AbortSignal.timeout(9000)});
+      if(!response.ok)throw new Error("Search unavailable");
+      const data=await response.json();
+      return json({suggestions:(data.quotes||[]).filter(x=>x.symbol).map(x=>({symbol:x.symbol,name:x.longname||x.shortname||x.symbol,exchange:x.exchange||""}))});
+    }catch{return json({suggestions:[]});}
+  }
+
+  if(!await rateLimit(env,req,"market-feed",15,60000))return json({error:"Market feed refresh limit reached. Try again shortly."},429);
+
+  // Keep the universe bounded so even a provider fallback stays within Worker subrequest limits.
+  const [catalog,indexedTickers]=await Promise.all([
+    all(env,"SELECT ticker,company,currency FROM ticker_catalog ORDER BY COALESCE(last_indexed_at,'') DESC LIMIT 60"),
+    all(env,"SELECT ticker,MAX(indexed_at) AS latest FROM market_index GROUP BY ticker ORDER BY latest DESC LIMIT 100")
+  ]);
+  const tickers=POPULAR.slice(0,8).concat(indexedTickers.map(x=>x.ticker),catalog.map(x=>x.ticker),POPULAR.slice(8))
+    .filter((ticker,index,items)=>validTicker(ticker)&&items.indexOf(ticker)===index).slice(0,24);
+  if(!tickers.length)return json({items:[],generated_at:isoNow(),index_counts:{PreviewIndex:0,FullIndex:0}});
+
+  const placeholders=tickers.map(()=>"?").join(",");
+  const [quoteRows,indexRows]=await Promise.all([
+    all(env,"SELECT * FROM market_quotes WHERE ticker IN ("+placeholders+")",...tickers),
+    all(env,"SELECT ticker,period,indexer,indexed_at,result FROM market_index WHERE ticker IN ("+placeholders+") AND horizon=30 AND ((indexer='FullIndex' AND indexed_at>=?) OR (indexer='PreviewIndex' AND indexed_at>=?)) ORDER BY indexed_at DESC",...tickers,new Date(Date.now()-24*3600000).toISOString(),new Date(Date.now()-8*3600000).toISOString())
+  ]);
+  const quotesByTicker=new Map(quoteRows.map(row=>[row.ticker,row]));
+  const catalogByTicker=new Map(catalog.map(row=>[row.ticker,row]));
+  const indexesByTicker=new Map();
+  for(const row of indexRows){
+    const existing=indexesByTicker.get(row.ticker);
+    if(!existing||(row.indexer==="FullIndex"&&existing.indexer!=="FullIndex")||
+      (row.indexer===existing.indexer&&row.indexed_at>existing.indexed_at))indexesByTicker.set(row.ticker,row);
+  }
+
+  const refreshed=await mapLimit(tickers,6,async ticker=>{
+    const cached=quotesByTicker.get(ticker)||null;
+    const cacheFresh=cached&&Date.now()-Date.parse(cached.updated_at||"")<5*60000;
+    if(cacheFresh)return {ticker,quote:cached};
+    try{
+      const quote=await yahooChart(ticker,"1y");
+      return {ticker,quote};
     }catch{
-      return {ticker,company:catalog.find(x=>x.ticker===ticker)?.company||ticker,currency:"USD",price:null,change_percent:null,indexer:null,history_preview:[],forecast_preview:[],expected_change_percent:null,source:"Market data unavailable"};
+      // Prefer an explicitly timestamped cached quote over dropping a still-useful index result.
+      return {ticker,quote:cached||{ticker,company:catalogByTicker.get(ticker)?.company||ticker,currency:catalogByTicker.get(ticker)?.currency||"USD",price:null,change_percent:null,as_of:null,source:"Quote temporarily unavailable"}};
     }
-  }));
+  });
+
+  const now=isoNow(),statements=[];
+  for(const item of refreshed){
+    const quote=item.quote;
+    if(quote.price!=null&&quote.company){
+      statements.push(stmt(env,"INSERT INTO market_quotes(ticker,company,currency,price,change_percent,as_of,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,price=excluded.price,change_percent=excluded.change_percent,as_of=excluded.as_of,source=excluded.source,updated_at=excluded.updated_at",item.ticker,quote.company,quote.currency||"USD",quote.price,quote.change_percent??null,quote.as_of||null,quote.source||"Yahoo Finance chart data",now));
+    }
+    const indexed=indexesByTicker.get(item.ticker);
+    if(quote.company){
+      statements.push(stmt(env,"INSERT INTO ticker_catalog(ticker,company,currency,last_indexed_at) VALUES(?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,last_indexed_at=COALESCE(excluded.last_indexed_at,ticker_catalog.last_indexed_at)",item.ticker,quote.company,quote.currency||"USD",indexed?.indexed_at||null));
+    }
+  }
+  if(statements.length)await env.DB.batch(statements);
+
+  const items=refreshed.map(({ticker,quote})=>{
+    const indexed=indexesByTicker.get(ticker),analysis=parse(indexed?.result);
+    const history=analysis?.history?.close||(quote.history||[]).slice(-60).map(row=>row.close);
+    return {
+      ticker,company:quote.company||ticker,currency:quote.currency||"USD",
+      price:quote.price??null,change_percent:quote.change_percent??null,as_of:quote.as_of||null,
+      indexer:indexed?.indexer||null,indexed_at:indexed?.indexed_at||null,
+      history_preview:history.slice(-45),
+      forecast_preview:analysis?.forecast?.hybrid?.slice(0,30)||[],
+      expected_change_percent:analysis?.forecast?.expected_change_percent??null,
+      source:(quote.source||"Yahoo Finance")+(indexed?" + shared index":"")
+    };
+  });
   const counts={PreviewIndex:0,FullIndex:0};
-  for(const x of items)if(x.indexer)counts[x.indexer]++;
-  return json({items,generated_at:isoNow(),index_counts:counts});
+  for(const item of items)if(item.indexer)counts[item.indexer]++;
+  return json({items,generated_at:now,index_counts:counts});
 }
 async function watchlist(req,env){
   const user=await authUser(req,env);if(!user)return json({error:"Sign in to use your watchlist."},401);
@@ -271,16 +345,19 @@ async function watchlist(req,env){
   }else if(action!=="list")return json({error:"Unknown watchlist action."},400);
   const items=await all(env,"SELECT ticker,created_at FROM watchlist_items WHERE user_id=? ORDER BY created_at DESC",user.id);
   const output=await Promise.all(items.map(async item=>{
-    let row=await first(env,"SELECT result,indexed_at,indexer FROM market_index WHERE ticker=? AND period='10y' AND horizon=30 AND indexer='FullIndex'",item.ticker);
-    if(!row)row=await first(env,"SELECT result,indexed_at,indexer FROM market_index WHERE ticker=? AND period='5y' AND horizon=30 AND indexer='PreviewIndex'",item.ticker);
+    const fullCutoff=new Date(Date.now()-24*3600000).toISOString(),previewCutoff=new Date(Date.now()-8*3600000).toISOString();
+    let row=await first(env,"SELECT result,indexed_at,indexer FROM market_index WHERE ticker=? AND period='10y' AND horizon=30 AND indexer='FullIndex' AND indexed_at>=?",item.ticker,fullCutoff);
+    if(!row)row=await first(env,"SELECT result,indexed_at,indexer FROM market_index WHERE ticker=? AND period='5y' AND horizon=30 AND indexer='PreviewIndex' AND indexed_at>=?",item.ticker,previewCutoff);
     const analysis=parse(row?.result);
     return {...item,indexer:row?.indexer||null,indexed_at:row?.indexed_at||null,analysis:analysis?{company:analysis.company,currency:analysis.currency,price:analysis.price,change_percent:analysis.change_percent,history_preview:analysis.history?.close?.slice(-60)||[],forecast_preview:analysis.forecast?.hybrid||[],expected_change_percent:analysis.forecast?.expected_change_percent}:null};
   }));
   return json({items:output});
 }
-async function requestMarketScan(env){
-  // Rapid scan: read every available 30-day index, without starting new indexing jobs.
-  const rows=await all(env,"SELECT ticker,period,indexer,indexed_at,result FROM market_index WHERE horizon=30 AND indexer IN ('PreviewIndex','FullIndex') ORDER BY indexed_at DESC LIMIT 1000");
+async function requestMarketScan(req,env){
+  if(!await rateLimit(env,req,"market-scan",30,3600000))return json({error:"Market Scan refresh limit reached. Try again later."},429);
+  // Read fresh 30-day index records only; this endpoint never queues new analyses.
+  const previewCutoff=new Date(Date.now()-8*3600000).toISOString(),fullCutoff=new Date(Date.now()-24*3600000).toISOString();
+  const rows=await all(env,"SELECT ticker,period,indexer,indexed_at,result FROM market_index WHERE horizon=30 AND ((indexer='PreviewIndex' AND indexed_at>=?) OR (indexer='FullIndex' AND indexed_at>=?)) ORDER BY indexed_at DESC LIMIT 1000",previewCutoff,fullCutoff);
   const byTicker=new Map();
   for(const row of rows){
     const analysis=parse(row.result), forecast=analysis?.forecast;
@@ -305,7 +382,7 @@ async function processJob(id,env){
   if(!job||job.status==="completed")return;
   const indexer=job.save_to_indexer==="FullIndex"?"FullIndex":"PreviewIndex",period=indexer==="FullIndex"?"10y":job.period||"5y",cooldownCutoff=new Date(Date.now()-6*3600000).toISOString();
   const recent=await first(env,"SELECT result,indexed_at,source_job_id FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=? LIMIT 1",job.ticker,period,job.horizon,indexer,cooldownCutoff);
-  if(recent?.result){
+  if(recent?.result&&job.job_type!=="hard_rescan"){
     await run(env,"UPDATE analysis_jobs SET status='completed',result=?,error=NULL,progress=100,stage='Six-hour cooldown active; reused existing index',updated_at=? WHERE id=?",recent.result,isoNow(),id);
     return;
   }
@@ -353,27 +430,33 @@ async function queueStatus(req,env){
   for(const row of rows)counts[row.status]=(counts[row.status]||0)+Number(row.count||0);
   return json({counts,active:counts.queued+counts.running,total:Object.values(counts).reduce((a,b)=>a+b,0),updated_at:isoNow()});
 }
-async function searchRoute(url,env){
+async function searchRoute(url,env,req){
   const query=url.searchParams.get("q")||url.searchParams.get("query")||"";
   if(!query.trim())return json({suggestions:[]});
   const next=new URL(url.toString());next.pathname="/api/market-feed";next.searchParams.set("q",query);
-  return marketFeed(next,env);
+  return marketFeed(next,env,req);
 }
 async function handleApi(req,env,url){
   const path=url.pathname;
   if(req.method==="OPTIONS")return new Response(null,{status:204,headers:CORS});
-  if(path==="/api/health")return json({ok:true,service:"revised-finanx",database:"D1",queue:"Cloudflare Queues",time:isoNow()});
+  if(path==="/api/health"){
+    try{
+      await first(env,"SELECT 1 AS ok");
+      const queueReady=typeof env.ANALYSIS_QUEUE?.send==="function";
+      return json({ok:queueReady,service:"revised-finanx",database:"D1",queue:queueReady?"Cloudflare Queues":"Unavailable",time:isoNow()},queueReady?200:503);
+    }catch(error){return json({ok:false,service:"revised-finanx",database:"Unavailable",queue:typeof env.ANALYSIS_QUEUE?.send==="function"?"Cloudflare Queues":"Unavailable",time:isoNow()},503);}
+  }
   if(path.startsWith("/api/auth/"))return authRoute(req,env,url);
-  if(path==="/api/market-feed"&&req.method==="GET")return marketFeed(url,env);
+  if(path==="/api/market-feed"&&req.method==="GET")return marketFeed(url,env,req);
   if(path==="/api/indexed-stats"&&req.method==="GET")return indexedStats(env);
-  if(path==="/api/search"&&req.method==="GET")return searchRoute(url,env);
+  if(path==="/api/search"&&req.method==="GET")return searchRoute(url,env,req);
   if(path==="/api/model-learning"&&req.method==="GET")return modelLearning(url,env);
   if(path==="/api/queue-status"&&req.method==="GET")return queueStatus(req,env);
   if(path==="/api/watchlist"&&req.method==="POST")return watchlist(req,env);
-  if(path==="/api/market-scan"&&req.method==="POST")return requestMarketScan(env);
+  if(path==="/api/market-scan"&&req.method==="POST")return requestMarketScan(req,env);
   if(path==="/api/jobs"&&req.method==="GET")return listJobs(req,env);
   if(path==="/api/request-analysis"&&req.method==="POST")return requestAnalysis(req,env);
-  if(path==="/api/analysis-status"&&req.method==="GET")return analysisStatus(url,env);
+  if(path==="/api/analysis-status"&&req.method==="GET")return analysisStatus(req,url,env);
   if(path==="/api/index-availability"&&req.method==="GET")return indexAvailability(url,env);
   if(path==="/api/stock-market-data"&&req.method==="GET")return stockMarketData(url,env);
   return json({error:"Not found."},404);
@@ -385,7 +468,7 @@ export default {
       try{return await handleApi(req,env,url);}catch(error){console.error("Finanx API error",error);return json({error:"The request could not be completed. Please try again."},500);}
     }
     if(url.pathname==="/favicon.ico")return new Response("",{status:204});
-    return new Response(PAGE,{headers:{"Content-Type":"text/html; charset=utf-8","Cache-Control":"no-store","X-Content-Type-Options":"nosniff","Referrer-Policy":"strict-origin-when-cross-origin","X-Frame-Options":"DENY","Permissions-Policy":"camera=(), microphone=(), geolocation=()"}});
+    return new Response(PAGE,{headers:{"Content-Type":"text/html; charset=utf-8","Cache-Control":"no-store","X-Content-Type-Options":"nosniff","Referrer-Policy":"strict-origin-when-cross-origin","X-Frame-Options":"DENY","Permissions-Policy":"camera=(), microphone=(), geolocation=()","Content-Security-Policy":"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"}});
   },
   async queue(batch,env){
     for(const message of batch.messages){
@@ -393,9 +476,13 @@ export default {
       catch(error){
         console.error("Queue job failed",error);
         const id=message.body?.jobId,attempts=Number(message.attempts||1);
-        if(id&&attempts<5)await run(env,"UPDATE analysis_jobs SET status='queued',progress=0,stage='Retrying after a temporary worker error',error=?,updated_at=? WHERE id=?",String(error?.message||error).slice(0,800),isoNow(),id);
-        else if(id)await run(env,"UPDATE analysis_jobs SET status='failed',progress=0,stage='Retry limit reached',error=?,updated_at=? WHERE id=?",String(error?.message||error).slice(0,800),isoNow(),id);
-        message.retry({delaySeconds:Math.min(300,20*Math.max(1,attempts))});
+        if(id&&attempts<5){
+          await run(env,"UPDATE analysis_jobs SET status='queued',progress=0,stage='Retrying after a temporary worker error',error=?,updated_at=? WHERE id=?",String(error?.message||error).slice(0,800),isoNow(),id);
+          message.retry({delaySeconds:Math.min(300,20*Math.max(1,attempts))});
+        }else{
+          if(id)await run(env,"UPDATE analysis_jobs SET status='failed',progress=0,stage='Retry limit reached',error=?,updated_at=? WHERE id=?",String(error?.message||error).slice(0,800),isoNow(),id);
+          message.ack();
+        }
       }
     }
   },

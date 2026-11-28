@@ -1,20 +1,36 @@
 # Revised Finanx
 
-A self-contained stock research and analysis application delivered by Cloudflare Workers. The web interface, API, background analysis worker and scheduled refreshes are all hosted by Cloudflare. GitHub Actions are not used for deployment or job processing.
+Finanx is a single-origin stock research application hosted on Cloudflare Workers. The Worker serves the application, provides the API, processes analysis jobs from Cloudflare Queues and schedules index refreshes. The GitHub Actions workflow runs regression tests only; it does not deploy the application or process jobs.
 
-## Included
+## Application
 
-- Responsive dashboard, market watch, search/discovery, personal watchlist, analysis queue and settings.
-- PreviewIndex and FullIndex with persistent two-button selection on the stock detail page.
-- Default PreviewIndex analysis for a newly entered ticker, with FullIndex available as an alternative.
-- Yahoo Finance chart data with short-lived quote caching and a second Yahoo host as a network fallback.
-- 15 original estimator signals (including a differenced ARIMA approximation and linear epsilon-SVR), 10 first-layer hybrids, 3 meta-hybrids and an adaptive primary ensemble in FullIndex; PreviewIndex runs a smaller 21-candidate set (7 + 10 + 3 + primary). Each index maintains separate global performance profiles.
-- Rolling chronological one-day validation and aggregate cross-account model-learning statistics. Each index keeps a separate global profile for the models it runs.
-- Historical and forecast charts, risk context, fundamentals where Yahoo returns them, and model diagnostics.
-- Account signup/sign-in, 30-day sessions, and user-scoped watchlists.
-- Cloudflare Queues for analysis jobs, retry handling and a dead-letter queue.
-- Cron Triggers for six-hour PreviewIndex refreshes and a daily FullIndex refresh.
-- D1 storage for accounts, sessions, jobs, indexes, cached quotes and model-learning state.
+- Responsive market overview with a tracked-universe summary, largest daily movers and a horizontally scrolling positive-forecast scan.
+- Separate stock discovery, personal watchlist, analysis queue, settings and stock-detail views.
+- Keyboard-operable stock cards and market activity rows, labelled search inputs, modal focus containment and reduced-motion support.
+- PreviewIndex and FullIndex selection on stock detail pages.
+- Historical price chart, indexed forecast chart, forecast range, fundamentals, risk context and model diagnostics.
+- Account signup/sign-in, hashed session tokens, password changes and user-scoped watchlists. Browsing and market research remain available without an account.
+- No forced sign-in prompt. Guest browsing is supported.
+
+## Data and analysis
+
+- Yahoo Finance chart data with a secondary Yahoo host fallback, short-lived D1 quote caching and bounded upstream concurrency.
+- Fresh PreviewIndex records are considered current for up to eight hours; FullIndex records for up to 24 hours.
+- Market Scan reads existing fresh 30-day index records only. It filters to strictly positive expected returns and sorts by expected return; it does not enqueue analysis jobs.
+- FullIndex contains 15 original estimators, 10 first-layer hybrids, 3 meta-hybrids and one primary ensemble. PreviewIndex uses seven selected original estimators with the same hybrid layers.
+- Directional validation uses chronological one-trading-day holdouts. This metric is not a measure of the accuracy of a 30-day price target.
+- Model-learning records aggregate model performance by index. They do not use account-specific watchlists as training data.
+- The forecasting engine is a lightweight JavaScript implementation designed for Cloudflare Workers. It is not a specialist Python/scikit-learn ARIMA/SVM implementation.
+
+## Backend safeguards
+
+- Passwords are PBKDF2-hashed with per-account salts; bearer session tokens are SHA-256 hashed before storage.
+- Public market feed, search, scan and analysis-request endpoints have per-IP rate limits.
+- User-owned analysis job status is checked against the authenticated user. Anonymous jobs remain pollable by their unguessable job IDs.
+- Password changes revoke all other sessions while retaining the current session.
+- Market-feed calls are concurrency-limited, and quote-provider outages do not hide a fresh cached index result.
+- Queue jobs are acknowledged after completion or terminal failure and retried only while retries remain.
+- API health checks verify the D1 binding and queue producer binding.
 
 ## Infrastructure
 
@@ -25,40 +41,48 @@ A self-contained stock research and analysis application delivered by Cloudflare
 - Bindings: `DB`, `ANALYSIS_QUEUE`
 - Scheduled triggers: every six hours for PreviewIndex; daily at 02:00 UTC for FullIndex.
 
-All account, watchlist and market-index data in this deployment starts in a fresh D1 database. The database is not a copy of any existing production data.
+The D1 database is configured in `wrangler.jsonc`. The application code does not automatically apply schema changes. Apply `schema.sql` to a new D1 database before first use; do not re-run destructive migrations against a database containing data.
 
-## Local development
+## Source structure
+
+- `src/worker.js`: deployed Worker routes, auth, data access, queue handling and scheduled jobs.
+- `src/page.js`: the HTML, CSS and browser application served by the Worker.
+- `src/models.js`: forecasting estimators, ensemble construction and chronological evaluation.
+- `index.html`: static mirror of the HTML embedded in `src/page.js`; keep these in sync.
+- `schema.sql`: D1 schema.
+- `tests/worker.test.mjs`: Worker, API contract, UI regression and model architecture tests.
+- `wrangler.jsonc`: Worker and Cloudflare binding configuration.
+
+The unused duplicate implementation that previously lived at `src/index.js` has been removed. Wrangler's configured entry point is `src/worker.js`.
+
+## Local development and tests
 
 1. Install Node.js 20 or newer.
 2. Run `npm install`.
-3. Run `npx wrangler login` and make sure the correct Cloudflare account is selected.
-4. Create or use the D1 database and queues described in `wrangler.jsonc`.
-5. Run `npx wrangler dev`.
-6. Run `npm test`.
+3. Configure the D1 database and Cloudflare Queues from `wrangler.jsonc`.
+4. Run `npx wrangler dev`.
+5. Run `npm test`.
+
+The `.github/workflows/quality.yml` workflow runs `npm test` on pushes and pull requests. It does not require deployment secrets.
 
 ## Deploy
 
-The live Worker has been uploaded directly to the Cloudflare Workers API (deployment ID: `67099c95a0ec4d6a88b7cba433410192`). For repeatable future deployments, connect this repository to Cloudflare Workers Builds in the Cloudflare dashboard (Workers & Pages → Create → Workers → Connect to Git). Select this repository and the `main` branch; use `npm install` as the install command and `npm test && npx wrangler deploy` as the build/deploy command. Do not add a GitHub Actions workflow.
+Deploy with Wrangler after the regression tests pass:
 
-The same bindings must be present on the Worker build:
-- D1: `DB` → `revised-finanx-db`
-- Queue producer: `ANALYSIS_QUEUE` → `revised-finanx-analysis`
-- Queue consumer: `revised-finanx-analysis`, batch size 5, 5 retries, dead-letter queue `revised-finanx-analysis-dlq`
-- Cron: `0 */6 * * *` and `0 2 * * *`
+```sh
+npm install
+npm test
+npx wrangler deploy
+```
+
+The existing Worker is configured with D1 binding `DB`, queue producer `ANALYSIS_QUEUE`, the queue consumer and scheduled triggers. Preserve these bindings when deploying.
 
 ## Live address
 
-The deployed app is available at:
+https://revised-finanx.stock-analyser-2026.workers.dev
 
-`https://revised-finanx.stock-analyser-2026.workers.dev`
+The Worker is not currently attached to `site.finanx.is-a-fullstack.dev`. That custom hostname requires the relevant DNS zone to be managed in the same Cloudflare account.
 
-The account's current DNS zone list does not include `is-a-fullstack.dev`, so the Worker cannot yet be attached to `site.finanx.is-a-fullstack.dev`. A custom domain can be added after that zone is managed in the same Cloudflare account (or a domain owned by you is added there).
+## Limitations
 
-## Notes and limitations
-
-- Yahoo Finance endpoints are unofficial and can rate-limit, delay, or change. Quote timestamps are exposed in the API response; refreshing a page does not make upstream data real-time.
-- FullIndex has the requested 29-candidate architecture (15 + 10 + 3 + primary). PreviewIndex intentionally uses a smaller selected ensemble.
-- Directional accuracy is measured on chronological holdouts. It is not guaranteed to reach 70%, and results may vary substantially by instrument and market regime.
-- Global learning stores aggregate model outcomes; it does not use a person's watchlist as training data.
-- The forecasting engine is a lightweight JavaScript implementation intended to run inside Workers. It does not replicate a specialised Python/scikit-learn ARIMA/SVM engine.
-- Financial information is for research and education only, not investment advice.
+Yahoo Finance endpoints are unofficial and can rate-limit, delay or change. Quote timestamps may be older than the time a page is refreshed. A 30-day forecast is an uncertain model output, not a guaranteed result or personalised investment recommendation. Market data can be delayed, incomplete or inaccurate. The application is for research and education only.

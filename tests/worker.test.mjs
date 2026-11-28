@@ -1,30 +1,105 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
+import { readFile } from "node:fs/promises";
 import worker from "../src/worker.js";
 import { getOriginalPredictions, ensemblePredictions, buildModelEvaluation, modelCandidates } from "../src/models.js";
 
-test("serves the Finanx single-page application", async () => {
+function testEnv({ firstResult = null, failDatabase = false } = {}) {
+  const calls = { sql: [], queue: 0, batches: 0 };
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            calls.sql.push({ sql, args });
+            return {
+              first: async () => {
+                if (failDatabase) throw new Error("D1 unavailable");
+                if (sql.includes("SELECT 1 AS ok")) return { ok: 1 };
+                if (typeof firstResult === "function") {
+                  const custom = firstResult(sql, args);
+                  if (custom !== undefined && custom !== null) return custom;
+                }
+                if (sql.includes("INSERT INTO api_rate_limits")) return { attempts: 1 };
+                return firstResult;
+              },
+              all: async () => ({ results: [] }),
+              run: async () => ({ success: true, meta: { changes: 1 } })
+            };
+          }
+        };
+      },
+      batch: async () => { calls.batches++; return []; }
+    },
+    ANALYSIS_QUEUE: { send: async () => { calls.queue++; } },
+    calls
+  };
+  return env;
+}
+
+test("serves the Finanx application and core pages", async () => {
   const response = await worker.fetch(new Request("https://finanx.test/"), {}, { waitUntil() {} });
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type"), /text\/html/);
+  assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+  assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
   const html = await response.text();
-  assert.match(html, /Market intelligence/);
-  assert.match(html, /PreviewIndex/);
-  assert.match(html, /FullIndex/);
-  assert.match(html, /Run market scan/);
-  assert.match(html, /stock-chart/);
+  for (const marker of [
+    "Market intelligence", "Market Activity", "Market Scan", "PreviewIndex",
+    "FullIndex", "stock-chart", "history-chart", "market-activity",
+    "password-form", "Analysis queue", "Watchlist"
+  ]) assert.ok(html.includes(marker), `Missing page marker: ${marker}`);
+  assert.match(html, /\.cards:not\(\.scan-rail\)\{display:grid!important/);
+  assert.match(html, /\.scan-rail\{display:flex!important/);
+  assert.doesNotMatch(html, /setTimeout\(\(\)=>showAuth/);
 });
 
-test("provides a health endpoint", async () => {
-  const response = await worker.fetch(new Request("https://finanx.test/api/health"), {}, { waitUntil() {} });
+test("embedded browser JavaScript parses and has no duplicate HTML IDs", async () => {
+  const response = await worker.fetch(new Request("https://finanx.test/"), {}, { waitUntil() {} });
+  const html = await response.text();
+  const script = html.split("<script>")[1]?.split("</script>")[0] || "";
+  assert.ok(script, "The application script must exist");
+  assert.doesNotThrow(() => new vm.Script(script), "Browser JavaScript must parse before deployment");
+  const markup = html.slice(0, html.indexOf("<script>"));
+  const ids = [...markup.matchAll(/id="([^"]+)"/g)].map(match => match[1]);
+  assert.equal(new Set(ids).size, ids.length, "HTML IDs must be unique");
+  const indexHtml = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  assert.equal(indexHtml, html, "Static index.html and the Worker page must remain byte-for-byte synchronised");
+});
+
+test("all static browser event-listener targets exist in the HTML", async () => {
+  const response = await worker.fetch(new Request("https://finanx.test/"), {}, { waitUntil() {} });
+  const html = await response.text();
+  const body = html.slice(html.indexOf("<body>"), html.indexOf("<script>"));
+  const script = html.split("<script>")[1]?.split("</script>")[0] || "";
+  const ids = new Set([...body.matchAll(/id="([^"]+)"/g)].map(match => match[1]));
+  const eventTargets = [...script.matchAll(/\$\("([^"]+)"\)\.addEventListener/g)].map(match => match[1]);
+  const missing = [...new Set(eventTargets.filter(id => !ids.has(id)))];
+  assert.deepEqual(missing, [], "Static event-listener targets must exist; generated targets should use explicit guards");
+});
+
+test("health endpoint verifies database and queue bindings", async () => {
+  const env = testEnv();
+  const response = await worker.fetch(new Request("https://finanx.test/api/health"), env, { waitUntil() {} });
   const body = await response.json();
   assert.equal(response.status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.database, "D1");
   assert.equal(body.queue, "Cloudflare Queues");
+  assert.ok(env.calls.sql.some(x => x.sql.includes("SELECT 1 AS ok")));
 });
 
-test("handles browser preflight requests", async () => {
+test("health endpoint reports a failed database check", async () => {
+  const env = testEnv({ failDatabase: true });
+  const response = await worker.fetch(new Request("https://finanx.test/api/health"), env, { waitUntil() {} });
+  const body = await response.json();
+  assert.equal(response.status, 503);
+  assert.equal(body.ok, false);
+  assert.equal(body.database, "Unavailable");
+});
+
+test("handles browser preflight requests without database access", async () => {
   const response = await worker.fetch(new Request("https://finanx.test/api/health", { method: "OPTIONS" }), {}, { waitUntil() {} });
   assert.equal(response.status, 204);
 });
@@ -32,6 +107,71 @@ test("handles browser preflight requests", async () => {
 test("unknown API routes return 404", async () => {
   const response = await worker.fetch(new Request("https://finanx.test/api/not-a-route"), {}, { waitUntil() {} });
   assert.equal(response.status, 404);
+});
+
+test("rejects unsupported forecast horizons before querying D1", async () => {
+  const env = testEnv();
+  const response = await worker.fetch(new Request("https://finanx.test/api/index-availability?ticker=AAPL&horizon=0"), env, { waitUntil() {} });
+  const body = await response.json();
+  assert.equal(response.status, 400);
+  assert.match(body.error, /whole number/);
+  assert.equal(env.calls.sql.length, 0);
+});
+
+test("does not expose a user-owned analysis job to anonymous callers", async () => {
+  const env = testEnv({
+    firstResult: sql => sql.includes("FROM analysis_jobs")
+      ? { id: "123e4567-e89b-12d3-a456-426614174000", ticker: "AAPL", status: "completed", result: "{}", user_id: "user-private" }
+      : null
+  });
+  const response = await worker.fetch(new Request("https://finanx.test/api/analysis-status?id=123e4567-e89b-12d3-a456-426614174000"), env, { waitUntil() {} });
+  assert.equal(response.status, 404);
+  assert.equal(env.calls.sql.length, 1);
+});
+
+test("market scan reads existing fresh indexes without enqueuing new work", async () => {
+  const env = testEnv();
+  const response = await worker.fetch(new Request("https://finanx.test/api/market-scan", { method: "POST", headers: { "Content-Type": "application/json", "cf-connecting-ip": "192.0.2.10" }, body: "{}" }), env, { waitUntil() {} });
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.queued, 0);
+  assert.deepEqual(body.items, []);
+  assert.equal(env.calls.queue, 0);
+  assert.ok(env.calls.sql.some(x => x.sql.includes("INSERT INTO api_rate_limits")));
+});
+
+test("rejects unsupported analysis horizons", async () => {
+  const env = testEnv();
+  const response = await worker.fetch(new Request("https://finanx.test/api/request-analysis", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ticker: "AAPL", horizon: 1.5 })
+  }), env, { waitUntil() {} });
+  const body = await response.json();
+  assert.equal(response.status, 400);
+  assert.match(body.error, /whole number/);
+});
+
+test("hard rescan bypasses cache cooldown and is persisted for the queue consumer", async () => {
+  const env = testEnv();
+  const response = await worker.fetch(new Request("https://finanx.test/api/request-analysis", {
+    method: "POST", headers: { "Content-Type": "application/json", "cf-connecting-ip": "192.0.2.20" },
+    body: JSON.stringify({ ticker: "AAPL", hard_rescan: true })
+  }), env, { waitUntil() {} });
+  const body = await response.json();
+  assert.equal(response.status, 202);
+  assert.equal(body.status, "queued");
+  assert.equal(env.calls.queue, 1);
+  const insert = env.calls.sql.find(x => x.sql.includes("INSERT INTO analysis_jobs"));
+  assert.ok(insert);
+  assert.ok(insert.args.includes("hard_rescan"));
+});
+
+test("market feed rate limit stops excessive refresh requests", async () => {
+  const env = testEnv({
+    firstResult: sql => sql.includes("INSERT INTO api_rate_limits") ? { attempts: 16 } : null
+  });
+  const response = await worker.fetch(new Request("https://finanx.test/api/market-feed"), env, { waitUntil() {} });
+  assert.equal(response.status, 429);
+  assert.equal(env.calls.sql.length, 1);
 });
 
 test("FullIndex uses 15 original models, 10 hybrids, 3 meta-hybrids and one primary", () => {
