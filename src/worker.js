@@ -284,7 +284,7 @@ async function marketFeed(url,env,req){
   const indexesByTicker=new Map();
   for(const row of indexRows){
     const existing=indexesByTicker.get(row.ticker);
-    if(!existing||(row.indexer==="FullIndex"&&existing.indexer!=="FullIndex")||
+    if(!existing||(row.indexer==="PreviewIndex"&&existing.indexer!=="PreviewIndex")||
       (row.indexer===existing.indexer&&row.indexed_at>existing.indexed_at))indexesByTicker.set(row.ticker,row);
   }
 
