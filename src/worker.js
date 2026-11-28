@@ -285,7 +285,7 @@ async function requestMarketScan(env){
   for(const row of rows){
     const analysis=parse(row.result), forecast=analysis?.forecast;
     const expected=Number(forecast?.expected_change_percent);
-    if(!analysis||!Number.isFinite(expected))continue;
+    if(!analysis||!Number.isFinite(expected)||expected<=0)continue;
     const existing=byTicker.get(row.ticker);
     // Prefer FullIndex when both are available; otherwise keep the newest record.
     if(!existing || (row.indexer==="FullIndex"&&existing.indexer!=="FullIndex") || (row.indexer===existing.indexer&&row.indexed_at>existing.indexed_at)){
@@ -293,7 +293,7 @@ async function requestMarketScan(env){
     }
   }
   const ranked=[...byTicker.values()].sort((a,b)=>b.expected_change_percent-a.expected_change_percent);
-  return json({scan_type:"indexed_30_day_rank",queued:0,scanned:ranked.length,items:ranked,generated_at:isoNow(),message:"Ranked existing indexes by their 30-day projected change. No new analysis jobs were queued."});
+  return json({scan_type:"positive_indexed_30_day_rank",queued:0,total_indexed:rows.length,scanned:ranked.length,items:ranked,generated_at:isoNow(),message:"Only positive 30-day forecasts are shown, ranked highest to lowest. No new analysis jobs were queued."});
 }
 async function listJobs(req,env){
   const user=await authUser(req,env);
