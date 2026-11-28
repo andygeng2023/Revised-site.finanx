@@ -79,7 +79,7 @@ async function authRoute(req,env,url){
   if(["signup","login"].includes(route)&&!await rateLimit(env,req,"auth-"+route,route==="signup"?5:12,3600000))return json({error:"Too many attempts. Try again later."},429);
   if(route==="signup"&&method==="POST"){
     const email=String(body.email||"").trim().toLowerCase(),password=String(body.password||"");
-    if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Enter a valid email and a password of at least 8 characters."},400);
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Enter a valid email and a password of at least 8 characters."},400);
     if(env.AUTH_KV){
       const existing=await env.AUTH_KV.get("user-email:"+email,"json");
       if(existing)return json({error:"An account with that email already exists."},409);
@@ -101,7 +101,7 @@ async function authRoute(req,env,url){
       }
     }catch(error){
       const message=String(error?.message||error);
-      if(/unique constraint|constraint failed.*users\\.email|users\\.email.*unique/i.test(message))return json({error:"An account with that email already exists."},409);
+      if(/unique constraint|constraint failed.*users\.email|users\.email.*unique/i.test(message))return json({error:"An account with that email already exists."},409);
       if(!env.AUTH_KV){console.error("Finanx signup stage: user insert",error);return json({error:"Signup failed at account creation (AUTH-02)."},500);}
       console.warn("Finanx signup: D1 write unavailable; saving the account in EU KV.",message);
       user.auth_store="kv";
@@ -117,7 +117,7 @@ async function authRoute(req,env,url){
   }
   if(route==="login"&&method==="POST"){
     const email=String(body.email||"").trim().toLowerCase(),password=String(body.password||"");
-    if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Email or password is incorrect."},401);
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Email or password is incorrect."},401);
     let row=null,source="d1";
     try{row=await first(env,"SELECT * FROM users WHERE email=? COLLATE NOCASE",email);}
     catch(error){console.warn("Finanx D1 credential lookup unavailable; checking EU KV.",String(error?.message||error));}
@@ -496,16 +496,34 @@ async function marketFeed(url,env,req){
 async function watchlist(req,env){
   const user=await authUser(req,env);if(!user)return json({error:"Sign in to use your watchlist."},401);
   const body=await req.json().catch(()=>({})),action=String(body.action||"list");
-  if(action==="add"){
-    const ticker=String(body.ticker||"").trim().toUpperCase();if(!validTicker(ticker))return json({error:"Enter a valid ticker."},400);
-    const count=await first(env,"SELECT COUNT(*) AS n FROM watchlist_items WHERE user_id=?",user.id);
-    const exists=await first(env,"SELECT id FROM watchlist_items WHERE user_id=? AND ticker=?",user.id,ticker);
-    if(!exists&&Number(count?.n||0)>=100)return json({error:"Watchlist limit is 100 instruments."},409);
-    await run(env,"INSERT OR IGNORE INTO watchlist_items(id,user_id,ticker,created_at) VALUES(?,?,?,?)",crypto.randomUUID(),user.id,ticker,isoNow());
-  }else if(action==="remove"){
-    const ticker=String(body.ticker||"").trim().toUpperCase();await run(env,"DELETE FROM watchlist_items WHERE user_id=? AND ticker=?",user.id,ticker);
-  }else if(action!=="list")return json({error:"Unknown watchlist action."},400);
-  const items=await all(env,"SELECT ticker,created_at FROM watchlist_items WHERE user_id=? ORDER BY created_at DESC",user.id);
+  let items=[];
+  if(user.auth_store==="kv"){
+    if(!env.AUTH_KV)return json({error:"Watchlist storage is temporarily unavailable."},503);
+    const key="watchlist:"+user.id;
+    items=await env.AUTH_KV.get(key,"json")||[];
+    if(action==="add"){
+      const ticker=String(body.ticker||"").trim().toUpperCase();if(!validTicker(ticker))return json({error:"Enter a valid ticker."},400);
+      if(!items.some(item=>item.ticker===ticker)){
+        if(items.length>=100)return json({error:"Watchlist limit is 100 instruments."},409);
+        items.unshift({ticker,created_at:isoNow()});
+        await env.AUTH_KV.put(key,JSON.stringify(items));
+      }
+    }else if(action==="remove"){
+      const ticker=String(body.ticker||"").trim().toUpperCase();items=items.filter(item=>item.ticker!==ticker);
+      await env.AUTH_KV.put(key,JSON.stringify(items));
+    }else if(action!=="list")return json({error:"Unknown watchlist action."},400);
+  }else{
+    if(action==="add"){
+      const ticker=String(body.ticker||"").trim().toUpperCase();if(!validTicker(ticker))return json({error:"Enter a valid ticker."},400);
+      const count=await first(env,"SELECT COUNT(*) AS n FROM watchlist_items WHERE user_id=?",user.id);
+      const exists=await first(env,"SELECT id FROM watchlist_items WHERE user_id=? AND ticker=?",user.id,ticker);
+      if(!exists&&Number(count?.n||0)>=100)return json({error:"Watchlist limit is 100 instruments."},409);
+      await run(env,"INSERT OR IGNORE INTO watchlist_items(id,user_id,ticker,created_at) VALUES(?,?,?,?)",crypto.randomUUID(),user.id,ticker,isoNow());
+    }else if(action==="remove"){
+      const ticker=String(body.ticker||"").trim().toUpperCase();await run(env,"DELETE FROM watchlist_items WHERE user_id=? AND ticker=?",user.id,ticker);
+    }else if(action!=="list")return json({error:"Unknown watchlist action."},400);
+    items=await all(env,"SELECT ticker,created_at FROM watchlist_items WHERE user_id=? ORDER BY created_at DESC",user.id);
+  }
   const output=await Promise.all(items.map(async item=>{
     const fullCutoff=new Date(Date.now()-24*3600000).toISOString(),previewCutoff=new Date(Date.now()-8*3600000).toISOString();
     let row=await first(env,"SELECT result,indexed_at,indexer,horizon FROM market_index WHERE ticker=? AND period='10y' AND horizon=60 AND indexer='FullIndex' AND indexed_at>=?",item.ticker,fullCutoff);
