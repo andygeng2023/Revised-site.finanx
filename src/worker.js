@@ -638,7 +638,16 @@ async function discoverIndexTickers(){
   return [...new Set(found)];
 }
 async function refreshIndexes(env,indexer){
-  const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString(),MAX_INDEXED=30000;
+  const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString(),staleCutoff=new Date(Date.now()-10*60000).toISOString(),MAX_INDEXED=30000;
+  // Recover jobs whose D1 status outlived their queue message (e.g. messages expired or a consumer crashed).
+  const stale=await all(env,"SELECT id,ticker FROM analysis_jobs WHERE save_to_indexer=? AND status IN ('queued','running') AND updated_at<? ORDER BY updated_at ASC LIMIT 4",indexer,staleCutoff);
+  if(stale.length){
+    const queue=indexer==="FullIndex"?env.FULLINDEX_QUEUE:env.PREVIEWINDEX_QUEUE;
+    if(!queue?.sendBatch)throw new Error(indexer+" queue binding is unavailable during recovery");
+    const batch=stale.map(job=>({body:{jobId:job.id}}));
+    await queue.sendBatch(batch);
+    await Promise.all(stale.map(job=>run(env,"UPDATE analysis_jobs SET status='queued',progress=0,stage='Recovered stale job; requeued by scheduled scan',updated_at=? WHERE id=?",isoNow(),job.id)));
+  }
   const discovered=await discoverIndexTickers();
   const catalog=(await all(env,"SELECT ticker FROM ticker_catalog ORDER BY COALESCE(last_indexed_at,'') ASC LIMIT 500")).map(x=>x.ticker);
   const [recentRows,activeRows,allIndexedRows]=await Promise.all([
@@ -736,8 +745,8 @@ export default {
     const cron=controller.cron||"";
     if(cron==="*/5 * * * *"){
       // Continuously discover and queue eligible stocks; each index type has its own 30,000 cap.
-      ctx.waitUntil(refreshIndexes(env,"PreviewIndex"));
-      ctx.waitUntil(refreshIndexes(env,"FullIndex"));
+      ctx.waitUntil(refreshIndexes(env,"PreviewIndex").catch(error=>console.error("PreviewIndex scheduled refresh failed",error)));
+      ctx.waitUntil(refreshIndexes(env,"FullIndex").catch(error=>console.error("FullIndex scheduled refresh failed",error)));
       const scheduledAt=new Date(Number(controller.scheduledTime||Date.now()));
       // The PreviewIndex cron also runs at Sunday 00:00 UTC; do housekeeping there
       // instead of adding another cron trigger and another scheduled invocation.
