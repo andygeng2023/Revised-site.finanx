@@ -671,7 +671,7 @@ async function refreshIndexes(env,indexer){
   }
 }
 async function refreshIndexesCore(env,indexer){
-  const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString(),staleCutoff=new Date(Date.now()-10*60000).toISOString(),MAX_INDEXED=30000;
+  const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString(),staleCutoff=new Date(Date.now()-2*3600000).toISOString(),MAX_INDEXED=30000;
   // Older discovery jobs omitted job_type='scan', which made queue metrics hide them.
   await run(env,"UPDATE analysis_jobs SET job_type='scan' WHERE job_type='analysis' AND user_id IS NULL AND stage LIKE 'Scheduled % discovery refresh'");
 
@@ -713,8 +713,8 @@ async function modelLearning(url,env){
 async function queueStatus(req,env){
   const user=await authUser(req,env),cutoff=new Date(Date.now()-7*86400000).toISOString();
   const rows=user
-    ? await all(env,"SELECT status,COUNT(*) AS count FROM analysis_jobs WHERE (user_id=? OR job_type='scan') AND created_at>=? GROUP BY status",user.id,cutoff)
-    : await all(env,"SELECT status,COUNT(*) AS count FROM analysis_jobs WHERE job_type='scan' AND created_at>=? GROUP BY status",cutoff);
+    ? await all(env,"SELECT status,COUNT(*) AS count FROM analysis_jobs WHERE (user_id=? OR job_type='scan' OR (user_id IS NULL AND stage LIKE 'Scheduled % discovery refresh')) AND created_at>=? GROUP BY status",user.id,cutoff)
+    : await all(env,"SELECT status,COUNT(*) AS count FROM analysis_jobs WHERE (job_type='scan' OR (user_id IS NULL AND stage LIKE 'Scheduled % discovery refresh')) AND created_at>=? GROUP BY status",cutoff);
   const counts={queued:0,running:0,completed:0,failed:0};
   for(const row of rows)counts[row.status]=(counts[row.status]||0)+Number(row.count||0);
   return json({counts,active:counts.queued+counts.running,total:Object.values(counts).reduce((a,b)=>a+b,0),updated_at:isoNow()});
