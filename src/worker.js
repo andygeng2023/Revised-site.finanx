@@ -378,8 +378,8 @@ async function requestMarketScan(req,env){
 }
 async function listJobs(req,env){
   const user=await authUser(req,env);
-  if(user)return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,status,progress,stage,updated_at FROM analysis_jobs WHERE user_id=? OR job_type='scan' ORDER BY created_at DESC LIMIT 40",user.id)});
-  return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,status,progress,stage,updated_at FROM analysis_jobs WHERE job_type='scan' ORDER BY created_at DESC LIMIT 24")});
+  if(user)return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,job_type,status,progress,stage,updated_at FROM analysis_jobs WHERE user_id=? OR job_type='scan' ORDER BY created_at DESC LIMIT 40",user.id)});
+  return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,job_type,status,progress,stage,updated_at FROM analysis_jobs WHERE job_type='scan' ORDER BY created_at DESC LIMIT 24")});
 }
 async function processJob(id,env){
   const job=await first(env,"SELECT * FROM analysis_jobs WHERE id=?",id);
