@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
+import { readFile } from "node:fs/promises";
 import worker from "../src/worker.js";
 import { getOriginalPredictions, ensemblePredictions, buildModelEvaluation, modelCandidates } from "../src/models.js";
 
@@ -51,6 +53,29 @@ test("serves the Finanx application and core pages", async () => {
   assert.match(html, /\.cards:not\(\.scan-rail\)\{display:grid!important/);
   assert.match(html, /\.scan-rail\{display:flex!important/);
   assert.doesNotMatch(html, /setTimeout\(\(\)=>showAuth/);
+});
+
+test("embedded browser JavaScript parses and has no duplicate HTML IDs", async () => {
+  const response = await worker.fetch(new Request("https://finanx.test/"), {}, { waitUntil() {} });
+  const html = await response.text();
+  const match = html.match(/<script>([\\s\\S]*?)<\\/script>/);
+  assert.ok(match, "The application script must exist");
+  assert.doesNotThrow(() => new vm.Script(match[1]), "Browser JavaScript must parse before deployment");
+  const ids = [...html.matchAll(/\\bid=["']([^"']+)["']/g)].map(match => match[1]);
+  assert.equal(new Set(ids).size, ids.length, "HTML IDs must be unique");
+  const indexHtml = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  assert.equal(indexHtml, html, "Static index.html and the Worker page must remain byte-for-byte synchronised");
+});
+
+test("all static browser event-listener targets exist in the HTML", async () => {
+  const response = await worker.fetch(new Request("https://finanx.test/"), {}, { waitUntil() {} });
+  const html = await response.text();
+  const body = html.slice(html.indexOf("<body>"), html.indexOf("<script>"));
+  const script = html.match(/<script>([\\s\\S]*?)<\\/script>/)?.[1] || "";
+  const ids = new Set([...body.matchAll(/\\bid=["']([^"']+)["']/g)].map(match => match[1]));
+  const eventTargets = [...script.matchAll(/\\$\\(["']([^"']+)["']\\)\\.addEventListener/g)].map(match => match[1]);
+  const missing = [...new Set(eventTargets.filter(id => !ids.has(id)))];
+  assert.deepEqual(missing, [], "Static event-listener targets must exist; generated targets should use explicit guards");
 });
 
 test("health endpoint verifies database and queue bindings", async () => {
