@@ -272,7 +272,7 @@ function storageGet(key){try{return localStorage.getItem(key);}catch{return null
 function storageSet(key,value){try{localStorage.setItem(key,value);return true;}catch{return false;}}
 function storageRemove(key){try{localStorage.removeItem(key);}catch{}}
 async function api(path,options={}){const headers=new Headers(options.headers||{});if(options.body!=null&&!headers.has("Content-Type"))headers.set("Content-Type","application/json");if(state.session?.access_token)headers.set("Authorization","Bearer "+state.session.access_token);const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);try{const response=await fetch(API+path,{...options,headers,signal:controller.signal,credentials:"same-origin",cache:"no-store"});const type=response.headers.get("content-type")||"";const data=type.includes("application/json")?await response.json().catch(()=>({})):{};if(!response.ok){const error=new Error(data.error||"Request failed ("+response.status+").");error.status=response.status;throw error;}return data;}catch(e){if(e.name==="AbortError")throw new Error("The request timed out. Check your connection and try again.");throw e;}finally{clearTimeout(timer);}}
-function setPage(name){const target=$("page-"+name);if(!target)return;document.querySelectorAll(".page").forEach(p=>p.classList.toggle("active",p===target));state.activePage=name;document.querySelectorAll("[data-nav]").forEach(b=>b.classList.toggle("active",b.dataset.nav===name));if(name==="watchlist")loadWatchlist();if(name==="analysis")loadJobs();window.scrollTo({top:0,behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth"});}
+function setPage(name){const target=$("page-"+name);if(!target)return;document.querySelectorAll(".page").forEach(p=>p.classList.toggle("active",p===target));state.activePage=name;document.querySelectorAll("[data-nav]").forEach(b=>b.classList.toggle("active",b.dataset.nav===name));if(name==="watchlist")loadWatchlist();if(name==="analysis")loadJobs();if(name==="settings")loadSettingsData();window.scrollTo({top:0,behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth"});}
 document.querySelectorAll("[data-nav]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();setPage(b.dataset.nav);}));$("home-explore-btn")?.addEventListener("click",()=>setPage("discover"));
 function showAuth(mode,fromPrompt){state.authMode=mode||"signin";$("auth-modal").classList.add("open");authMode(state.authMode);$("auth-feedback").textContent="";$("auth-email").focus();if(fromPrompt){try{sessionStorage.setItem("finanx-prompt-shown","1");}catch{}}}
 function closeAuth(){ $("auth-modal").classList.remove("open");try{sessionStorage.setItem("finanx-prompt-dismissed","1");}catch{}}
@@ -294,9 +294,190 @@ function card(item){const ticker=String(item?.ticker||"").trim(),v=Number(item?.
 function drawMini(canvas,history,forecast){const ctx=canvas.getContext("2d"),dpr=Math.min(devicePixelRatio||1,2),w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=w*dpr;canvas.height=h*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);history=numericSeries(history);forecast=numericSeries(forecast);const all=history.concat(forecast);if(all.length<2)return;const min=Math.min(...all),max=Math.max(...all),range=max-min||1,plotW=w,plotH=h,x=i=>i/(all.length-1)*plotW,y=v=>plotH-4-(v-min)/range*(plotH-8);ctx.beginPath();history.forEach((v,i)=>i?ctx.lineTo(x(i),y(v)):ctx.moveTo(x(i),y(v)));ctx.strokeStyle="#8eb3fa";ctx.lineWidth=1.7;ctx.setLineDash([]);ctx.stroke();if(forecast.length&&history.length){const start=history.length-1;ctx.beginPath();ctx.moveTo(x(start),y(history.at(-1)));forecast.forEach((v,i)=>ctx.lineTo(x(start+i+1),y(v)));ctx.strokeStyle="#75e0c1";ctx.setLineDash([4,3]);ctx.stroke();}ctx.setLineDash([]);}
 function renderMiniCharts(root){(root||document).querySelectorAll(".mini-chart").forEach(c=>{try{drawMini(c,JSON.parse(c.dataset.history||"[]"),JSON.parse(c.dataset.forecast||"[]"));}catch{const ctx=c.getContext("2d");if(ctx)ctx.clearRect(0,0,c.width,c.height);}});}
 function renderCards(root,items){if(!root)return;const list=Array.isArray(items)?items.filter(item=>item&&String(item.ticker||"").trim()):[];root.innerHTML=list.length?list.map(card).join(""):'<div class="empty">No matching indexed instruments are available yet.</div>';root.querySelectorAll(".stock-card[data-ticker]").forEach(el=>{el.setAttribute("role","button");el.tabIndex=0;el.setAttribute("aria-label","Open "+el.dataset.ticker+" stock analysis");const open=()=>openStock(el.dataset.ticker);el.addEventListener("click",e=>{if(e.target.closest(".remove-watch"))return;open();});el.addEventListener("keydown",e=>{if((e.key==="Enter"||e.key===" ")&&!e.target.closest("button")){e.preventDefault();open();}});});if(root.id==="watchlist-cards")root.querySelectorAll(".stock-card").forEach(el=>{const button=document.createElement("button");button.className="btn small remove-watch";button.type="button";button.textContent="Remove";button.addEventListener("click",async event=>{event.stopPropagation();try{await api("/api/watchlist",{method:"POST",body:JSON.stringify({action:"remove",ticker:el.dataset.ticker})});await loadWatchlist();toast(el.dataset.ticker+" removed.");}catch(error){toast(error.message);}});el.querySelector(".card-bottom")?.appendChild(button);});renderMiniCharts(root);}
-async function loadMarket(options={}){if(state.marketLoading)return;state.marketLoading=true;try{const results=await Promise.allSettled([api("/api/market-feed"),api("/api/indexed-stats")]);if(results[0].status==="rejected")throw results[0].reason;const data=results[0].value||{},indexStats=results[1].status==="fulfilled"?results[1].value:{};state.quoteItems=Array.isArray(data.items)?data.items:[];const valid=state.quoteItems.filter(x=>x&&x.ticker),ranked=valid.filter(x=>x.expected_change_percent!=null&&Number.isFinite(Number(x.expected_change_percent))).slice().sort((a,b)=>Number(b.expected_change_percent)-Number(a.expected_change_percent)),movers=valid.slice().sort((a,b)=>Math.abs(Number(b.change_percent)||0)-Math.abs(Number(a.change_percent)||0));const homeFeatured=$("home-featured-cards");if(homeFeatured)renderCards(homeFeatured,valid.slice(0,8));const discoverFeatured=$("discover-featured-cards");if(discoverFeatured)renderCards(discoverFeatured,valid.slice(0,24));const recommended=$("watchlist-recommended");if(recommended)renderCards(recommended,ranked.slice(0,24));const opportunities=$("watchlist-opportunities");if(opportunities)renderCards(opportunities,movers.slice(0,24));const up=valid.filter(x=>Number(x.change_percent)>0).length;$("stat-count").textContent=String(indexStats.tracked??valid.length);$("stat-breadth").textContent=valid.length?Math.round(100*up/valid.length)+"%":"—";$("stat-preview").textContent=String(indexStats.preview?.tickers??"—");$("stat-full").textContent=String(indexStats.full?.tickers??"—");$("market-updated").textContent="Feed refreshed "+new Date(data.generated_at||Date.now()).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});state.marketLoaded=true;}catch(error){$("market-updated").textContent="Market feed unavailable";for(const id of ["home-featured-cards","discover-featured-cards","watchlist-recommended","watchlist-opportunities"]){const root=$(id);if(root)root.innerHTML='<div class="empty">Market feed temporarily unavailable. Refresh to retry.</div>';}if(options.notify)toast(error.message);}finally{state.marketLoading=false;}}
+
+function setText(id,value){const node=$(id);if(node)node.textContent=String(value??"—");}
+function formatWhen(value){if(!value)return "—";const date=new Date(value);return Number.isNaN(date.getTime())?"—":date.toLocaleString([],{dateStyle:"medium",timeStyle:"short"});}
+function renderFeedRows(root,items,emptyText){
+  if(!root)return;
+  const rows=Array.isArray(items)?items.filter(item=>item&&item.ticker):[];
+  root.innerHTML=rows.length?rows.map(item=>{
+    const daily=item.change_percent!=null&&Number.isFinite(Number(item.change_percent));
+    const forecast=item.expected_change_percent!=null&&Number.isFinite(Number(item.expected_change_percent));
+    const secondary=[item.indexer||"Not indexed",item.as_of?("Quote "+formatWhen(item.as_of)):null].filter(Boolean).join(" · ");
+    const dayClass=!daily?"muted":Number(item.change_percent)>=0?"up":"down";
+    const forecastClass=!forecast?"muted":Number(item.expected_change_percent)>=0?"up":"down";
+    return '<div class="feed-row" data-ticker="'+escapeHTML(item.ticker)+'" role="button" tabindex="0" aria-label="Open '+escapeHTML(item.ticker)+' analysis"><div><div class="feed-symbol">'+escapeHTML(item.ticker)+'</div><div class="feed-company">'+escapeHTML(item.company||item.ticker)+'</div><div class="feed-company">'+escapeHTML(secondary||"Market data")+'</div></div><div class="feed-price">'+money(item.price,item.currency)+'<small class="'+dayClass+'">'+(daily?pct(item.change_percent):"Daily change unavailable")+'</small><small class="'+forecastClass+'">'+(forecast?"30-day "+pct(item.expected_change_percent):"Forecast unavailable")+'</small></div></div>';
+  }).join(""):'<div class="empty">'+escapeHTML(emptyText||"No matching data is available yet.")+'</div>';
+  root.querySelectorAll("[data-ticker]").forEach(el=>{
+    const open=()=>openStock(el.dataset.ticker);
+    el.addEventListener("click",open);
+    el.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();open();}});
+  });
+}
+function renderJobRows(root,jobs,emptyText){
+  if(!root)return;
+  const rows=Array.isArray(jobs)?jobs:[];
+  root.innerHTML=rows.length?rows.map(job=>'<div class="feed-row" data-job-ticker="'+escapeHTML(job.ticker||"")+'" role="button" tabindex="0"><div><div class="feed-symbol">'+escapeHTML(job.ticker||"Analysis")+'</div><div class="feed-company">'+escapeHTML(job.indexer||"Index not set")+' · '+escapeHTML(job.stage||job.status||"")+'</div><div class="feed-company">'+escapeHTML(formatWhen(job.updated_at))+'</div></div><div class="feed-price"><span class="pill '+(job.status==="completed"?"green":job.status==="failed"?"red":"amber")+'">'+escapeHTML(job.status||"unknown")+'</span><small>'+Number(job.progress||0)+'% complete</small></div></div>').join(""):'<div class="empty">'+escapeHTML(emptyText||"No recent jobs are available.")+'</div>';
+  root.querySelectorAll("[data-job-ticker]").forEach(el=>{
+    const open=()=>{if(el.dataset.jobTicker)openStock(el.dataset.jobTicker);};
+    el.addEventListener("click",open);
+    el.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();open();}});
+  });
+}
+function returnVolatility(item){
+  const prices=numericSeries(item.history_preview),returns=[];
+  for(let i=1;i<prices.length;i++){if(prices[i-1]!==0)returns.push((prices[i]/prices[i-1]-1)*100);}
+  if(returns.length<3)return null;
+  const mean=returns.reduce((a,b)=>a+b,0)/returns.length;
+  return Math.sqrt(returns.reduce((sum,value)=>sum+Math.pow(value-mean,2),0)/returns.length);
+}
+function currentWatchlistItems(){
+  const market=new Map(state.quoteItems.map(item=>[item.ticker,item]));
+  return state.watchlist.map(saved=>{
+    const indexed=saved.analysis||{},quote=market.get(saved.ticker)||{};
+    return {ticker:saved.ticker,company:quote.company||indexed.company||saved.ticker,currency:quote.currency||indexed.currency||"USD",price:quote.price??indexed.price??null,change_percent:quote.change_percent??indexed.change_percent??null,indexer:saved.indexer||quote.indexer||null,indexed_at:saved.indexed_at||quote.indexed_at||null,history_preview:indexed.history_preview?.length?indexed.history_preview:quote.history_preview||[],forecast_preview:indexed.forecast_preview?.length?indexed.forecast_preview:quote.forecast_preview||[],expected_change_percent:indexed.expected_change_percent??quote.expected_change_percent??null,as_of:quote.as_of||null,created_at:saved.created_at};
+  });
+}
+function renderWatchlistSections(){
+  const saved=currentWatchlistItems();
+  if(!state.user){
+    const prompt='<div class="empty">Sign in to save and sync your watchlist. <button class="btn primary small" type="button" data-watch-signin>Sign in</button></div>';
+    for(const id of ["watchlist-cards","home-watchlist-cards"]){const root=$(id);if(root)root.innerHTML=prompt;}
+    document.querySelectorAll("[data-watch-signin]").forEach(button=>button.addEventListener("click",()=>showAuth("signin")));
+  }else{
+    renderCards($("watchlist-cards"),saved);
+    renderCards($("home-watchlist-cards"),saved.slice(0,6));
+  }
+  const priced=saved.filter(item=>item.price!=null&&Number.isFinite(Number(item.price)));
+  const advancing=saved.filter(item=>item.change_percent!=null&&Number(item.change_percent)>0);
+  const indexed=saved.filter(item=>item.expected_change_percent!=null&&Number.isFinite(Number(item.expected_change_percent)));
+  [["wl-count",saved.length],["wl-priced",priced.length],["wl-advancing",advancing.length],["wl-indexed",indexed.length]].forEach(([id,value])=>setText(id,value));
+  const gainers=saved.filter(item=>Number(item.change_percent)>0).sort((a,b)=>Number(b.change_percent)-Number(a.change_percent));
+  const decliners=saved.filter(item=>Number(item.change_percent)<0).sort((a,b)=>Number(a.change_percent)-Number(b.change_percent));
+  const forecasts=indexed.slice().sort((a,b)=>Number(b.expected_change_percent)-Number(a.expected_change_percent));
+  renderFeedRows($("watchlist-gainers"),gainers.slice(0,8),"No saved instruments have a positive daily change available.");
+  renderFeedRows($("watchlist-decliners"),decliners.slice(0,8),"No saved instruments have a negative daily change available.");
+  renderFeedRows($("watchlist-forecasts"),forecasts.slice(0,8),"No saved instrument currently has an indexed forecast.");
+  const highlights=[];
+  if(gainers[0])highlights.push(gainers[0]);
+  if(decliners[0])highlights.push(decliners[0]);
+  if(forecasts[0]&&!highlights.some(item=>item.ticker===forecasts[0].ticker))highlights.push(forecasts[0]);
+  renderFeedRows($("watchlist-highlights"),highlights,"Highlights appear when quotes or forecasts are available.");
+  renderFeedRows($("watchlist-recent"),saved.slice(0,8),"No saved instruments yet.");
+  const stats=state.indexStats||{};
+  setText("wl-market-tracked",stats.tracked??"—");
+  setText("wl-market-preview",stats.preview?.tickers??"—");
+  setText("wl-market-full",stats.full?.tickers??"—");
+  setText("wl-market-updated",state.marketMeta?.generated_at?new Date(state.marketMeta.generated_at).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"—");
+}
+function renderLearningPanel(root,learning){
+  if(!root)return;
+  if(!learning||!Array.isArray(learning.profiles)||!learning.profiles.length){root.innerHTML='<div class="empty">No shared model-learning records have been returned.</div>';return;}
+  root.innerHTML=learning.profiles.slice(0,6).map(profile=>'<div class="feed-row"><div><div class="feed-symbol">'+escapeHTML(profile.key)+'</div><div class="feed-company">'+Number(profile.observations||0).toLocaleString()+' validation observations</div></div><div class="feed-price">'+(profile.accuracy==null?"—":(Number(profile.accuracy)*100).toFixed(1)+"%")+'<small>Observed accuracy</small></div></div>').join("");
+}
+function renderMarketSections(){
+  const valid=state.quoteItems.filter(item=>item&&item.ticker);
+  const priced=valid.filter(item=>item.price!=null&&Number.isFinite(Number(item.price)));
+  const daily=valid.filter(item=>item.change_percent!=null&&Number.isFinite(Number(item.change_percent)));
+  const gainers=daily.filter(item=>Number(item.change_percent)>0).sort((a,b)=>Number(b.change_percent)-Number(a.change_percent));
+  const decliners=daily.filter(item=>Number(item.change_percent)<0).sort((a,b)=>Number(a.change_percent)-Number(b.change_percent));
+  const flat=daily.filter(item=>Number(item.change_percent)===0);
+  const average=daily.length?daily.reduce((sum,item)=>sum+Number(item.change_percent),0)/daily.length:null;
+  const indexed=valid.filter(item=>item.expected_change_percent!=null&&Number.isFinite(Number(item.expected_change_percent))).sort((a,b)=>Number(b.expected_change_percent)-Number(a.expected_change_percent));
+  const volatility=valid.map(item=>({item,score:returnVolatility(item)})).filter(x=>x.score!=null).sort((a,b)=>b.score-a.score);
+  const stats=state.indexStats||{},preview=Number(stats.preview?.tickers||0),full=Number(stats.full?.tickers||0);
+  renderCards($("home-featured-cards"),valid.slice(0,8));
+  renderCards($("discover-featured-cards"),valid.slice(0,24));
+  renderCards($("watchlist-recommended"),indexed.slice(0,12));
+  renderCards($("watchlist-opportunities"),valid.slice().sort((a,b)=>Math.abs(Number(b.change_percent)||0)-Math.abs(Number(a.change_percent)||0)).slice(0,12));
+  renderFeedRows($("home-advancers"),gainers.slice(0,6),"No advancing instruments are available in the current feed.");
+  renderFeedRows($("home-decliners"),decliners.slice(0,6),"No declining instruments are available in the current feed.");
+  renderFeedRows($("discover-gainers"),gainers.slice(0,10),"No positive daily moves are available.");
+  renderFeedRows($("discover-decliners"),decliners.slice(0,10),"No negative daily moves are available.");
+  renderFeedRows($("discover-volatility"),volatility.slice(0,8).map(x=>({...x.item,company:(x.item.company||x.item.ticker)+" · "+x.score.toFixed(2)+"% return volatility"})),"Not enough historical data to calculate this measure.");
+  renderFeedRows($("discover-forecast-leaders"),indexed.slice(0,8),"No indexed 30-day forecasts are present in this feed.");
+  setText("stat-count",stats.tracked??valid.length);
+  setText("stat-breadth",daily.length?Math.round(gainers.length/daily.length*100)+"%":"—");
+  setText("stat-preview",preview);setText("stat-full",full);
+  setText("pulse-up",gainers.length);setText("pulse-down",decliners.length);setText("pulse-flat",flat.length);
+  setText("pulse-average",average==null?"—":pct(average));
+  setText("home-pulse-caption",daily.length+" instruments with reported daily changes");
+  setText("discover-priced",priced.length+" / "+valid.length);
+  setText("discover-up",gainers.length);setText("discover-down",decliners.length);setText("discover-indexed",indexed.length);
+  setText("home-coverage-tracked",stats.tracked??"—");setText("home-coverage-preview",preview);
+  setText("home-coverage-full",full);setText("home-coverage-priced",priced.length+" / "+valid.length);
+  setText("home-coverage-note",state.marketMeta?.stale?"Showing the saved snapshot because the latest refresh was throttled or unavailable.":"Coverage is based on the latest API response.");
+  const stamped=valid.filter(item=>item.as_of);
+  const times=stamped.map(item=>Date.parse(item.as_of)).filter(Number.isFinite);
+  const latest=times.length?Math.max(...times):null,oldest=times.length?Math.min(...times):null;
+  const quality=[["Feed snapshot",formatWhen(state.marketMeta?.generated_at)],["Quotes with timestamps",stamped.length+" / "+valid.length],["Newest quote timestamp",latest?formatWhen(new Date(latest).toISOString()):"Not supplied"],["Oldest quote timestamp",oldest?formatWhen(new Date(oldest).toISOString()):"Not supplied"],["Refresh state",state.marketMeta?.stale?"Saved snapshot":"Latest refresh completed"]];
+  const qualityRoot=$("discover-data-quality");
+  if(qualityRoot)qualityRoot.innerHTML=quality.map(row=>'<div class="settings-info-row"><strong>'+escapeHTML(row[0])+'</strong><span>'+escapeHTML(row[1])+'</span></div>').join("");
+  renderWatchlistSections();
+}
+function applyMarketFeed(data,indexStats,options={}){
+  const items=Array.isArray(data?.items)?data.items:[];
+  if(items.length||!state.quoteItems.length)state.quoteItems=items;
+  if(indexStats&&typeof indexStats==="object")state.indexStats=indexStats;
+  state.marketMeta={generated_at:data?.generated_at||new Date().toISOString(),stale:!!(options.cached||data?.stale),refresh_limited:!!data?.refresh_limited};
+  if(items.length&&!options.cached)storageSet(MARKET_CACHE_KEY,JSON.stringify({items:state.quoteItems,indexStats:state.indexStats,generated_at:data.generated_at||new Date().toISOString()}));
+  renderMarketSections();
+  const stamp=state.marketMeta.generated_at?new Date(state.marketMeta.generated_at).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"";
+  setText("market-updated",state.marketMeta.stale?"Saved snapshot · "+stamp:"Feed refreshed "+stamp);
+  state.marketLoaded=true;
+}
+function restoreMarketSnapshot(){
+  try{
+    const saved=JSON.parse(storageGet(MARKET_CACHE_KEY)||"null");
+    if(saved&&Array.isArray(saved.items)&&saved.items.length){
+      applyMarketFeed({items:saved.items,generated_at:saved.generated_at,stale:true},saved.indexStats,{cached:true});
+      return true;
+    }
+  }catch{}
+  return false;
+}
+
+async function loadMarket(options={}){
+  if(state.marketLoading)return;
+  state.marketLoading=true;
+  try{
+    const results=await Promise.allSettled([api("/api/market-feed"),api("/api/indexed-stats")]);
+    if(results[0].status==="rejected")throw results[0].reason;
+    const data=results[0].value||{};
+    const stats=results[1].status==="fulfilled"?results[1].value:(state.indexStats||{});
+    applyMarketFeed(data,stats);
+  }catch(error){
+    if(state.quoteItems.length){
+      renderMarketSections();
+      setText("market-updated","Saved snapshot · refresh failed");
+    }else{
+      ["home-featured-cards","discover-featured-cards"].forEach(id=>{const root=$(id);if(root)root.innerHTML='<div class="empty">No saved quote snapshot is available yet. Retry the refresh or open a ticker to request its analysis.</div>';});
+      setText("market-updated","No quote snapshot available");
+    }
+    if(options.notify)toast(error.message);
+  }finally{state.marketLoading=false;}
+}
 $("refresh-market").addEventListener("click",()=>loadMarket({notify:true}));
-async function refreshMarketScan(button){if(button){button.disabled=true;button.textContent="Refreshing…";}try{const result=await api("/api/market-scan",{method:"POST",body:JSON.stringify({})});const items=Array.isArray(result.items)?result.items:[];if($("home-scan-picks"))renderCards($("home-scan-picks"),items);if($("discover-scan-picks"))renderCards($("discover-scan-picks"),items);if(button)toast(items.length?"Market Scan refreshed: "+items.length+" fresh positive forecasts.":"No fresh positive indexed forecasts were found.");}catch(error){for(const id of ["home-scan-picks","discover-scan-picks"]){const root=$(id);if(root)root.innerHTML='<div class="empty">Market Scan is temporarily unavailable. Please retry.</div>';}if(button)toast(error.message);}finally{if(button){button.disabled=false;button.textContent="Refresh scan";}}}$("run-market-scan").addEventListener("click",e=>refreshMarketScan(e.currentTarget));$("run-home-market-scan").addEventListener("click",e=>refreshMarketScan(e.currentTarget));refreshMarketScan(null);
+async function refreshMarketScan(button){
+  if(button){button.disabled=true;button.textContent="Refreshing…";}
+  try{
+    const result=await api("/api/market-scan",{method:"POST",body:JSON.stringify({})});
+    const items=Array.isArray(result.items)?result.items:[];
+    state.scanItems=items;
+    if(items.length)storageSet(SCAN_CACHE_KEY,JSON.stringify({items,generated_at:result.generated_at}));
+    ["home-scan-picks","discover-scan-picks"].forEach(id=>{const root=$(id);if(root)renderCards(root,items);});
+    if(button)toast(items.length?"Market Scan refreshed: "+items.length+" indexed forecasts.":"No fresh positive indexed forecasts were found.");
+  }catch(error){
+    if(!state.scanItems.length){try{const saved=JSON.parse(storageGet(SCAN_CACHE_KEY)||"null");if(Array.isArray(saved?.items))state.scanItems=saved.items;}catch{}}
+    ["home-scan-picks","discover-scan-picks"].forEach(id=>{
+      const root=$(id);
+      if(root){if(state.scanItems.length)renderCards(root,state.scanItems);else root.innerHTML='<div class="empty">No saved positive forecast snapshot is available yet.</div>';}
+    });
+    if(button)toast(state.scanItems.length?"Showing the previously loaded Market Scan.":error.message);
+  }finally{if(button){button.disabled=false;button.textContent="Refresh scan";}}
+}
+$("run-market-scan").addEventListener("click",e=>refreshMarketScan(e.currentTarget));
+$("run-home-market-scan").addEventListener("click",e=>refreshMarketScan(e.currentTarget));
 function showJob(id,ticker,index){state.analysisRequest={id,ticker,index};$("jobbar").classList.add("show");$("jobbar-title").textContent=ticker+" · "+index;$("jobbar-stage").textContent="Queued";$("jobbar-progress").style.width="0%";$("detail-job-status").textContent="Queued";$("detail-progress").style.width="0%";pollJob(id,ticker,index);}
 async function pollJob(id,ticker,index){clearTimeout(state.pollTimer);if(state.ticker!==ticker||state.analysisRequest?.id!==id)return;try{const job=await api("/api/analysis-status?id="+encodeURIComponent(id));if(state.ticker!==ticker||state.analysisRequest?.id!==id)return;const progress=Number(job.progress||0);$("jobbar-progress").style.width=progress+"%";$("detail-progress").style.width=progress+"%";$("jobbar-stage").textContent=job.stage||job.status;$("detail-stage").textContent=job.stage||job.status;$("detail-job-status").textContent=job.status+" · "+progress+"%";if(job.status==="completed"){ $("jobbar-title").textContent=ticker+" analysis complete";$("jobbar-stage").textContent="Forecast ready";if(job.result){renderAnalysis(job.result,index);}$("jobbar").classList.remove("show");return;}if(job.status==="failed"){$("jobbar-title").textContent=ticker+" analysis failed";$("jobbar-stage").textContent=job.error||"Analysis failed."; $("detail-stage").textContent=job.error||"Analysis failed."; $("detail-job-status").textContent="Failed";return;}state.pollTimer=setTimeout(()=>pollJob(id,ticker,index),1800);}catch(e){if(state.ticker!==ticker||state.analysisRequest?.id!==id)return;$("detail-stage").textContent=e.message;$("jobbar-stage").textContent=e.message;$("detail-job-status").textContent="Could not refresh status";state.pollTimer=setTimeout(()=>pollJob(id,ticker,index),5000);}}
 $("jobbar-open").addEventListener("click",()=>{if(state.analysisRequest)openStock(state.analysisRequest.ticker,state.analysisRequest.index);});
@@ -307,14 +488,98 @@ document.querySelectorAll("[data-index]").forEach(b=>b.addEventListener("click",
 function drawBigChart(canvasId,history,forecast){const c=$(canvasId);if(!c)return;const ctx=c.getContext("2d");if(!ctx)return;const box=c.getBoundingClientRect(),w=Math.max(1,Math.floor(box.width||c.parentElement?.clientWidth||320)),h=Math.max(170,Math.floor(box.height||250)),dpr=Math.min(window.devicePixelRatio||1,2);c.width=Math.round(w*dpr);c.height=Math.round(h*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);const hist=numericSeries(history),pred=numericSeries(forecast),values=hist.concat(pred);ctx.fillStyle="#8fa5bf";ctx.font="12px system-ui";if(hist.length<2){ctx.fillText("Historical price data is not available.",15,35);return;}const min=Math.min(...values),max=Math.max(...values),range=max-min||1,pad={l:12,r:12,t:14,b:25},x=i=>pad.l+i/Math.max(1,values.length-1)*(w-pad.l-pad.r),y=v=>h-pad.b-(v-min)/range*(h-pad.t-pad.b);ctx.strokeStyle="rgba(125,153,185,.18)";ctx.lineWidth=1;for(let i=0;i<4;i++){const gy=pad.t+i*(h-pad.t-pad.b)/3;ctx.beginPath();ctx.moveTo(pad.l,gy);ctx.lineTo(w-pad.r,gy);ctx.stroke();}ctx.beginPath();hist.forEach((v,i)=>i?ctx.lineTo(x(i),y(v)):ctx.moveTo(x(i),y(v)));ctx.strokeStyle="#9abaff";ctx.lineWidth=2;ctx.setLineDash([]);ctx.stroke();if(pred.length){const start=hist.length-1;ctx.beginPath();ctx.moveTo(x(start),y(hist.at(-1)));pred.forEach((v,i)=>ctx.lineTo(x(start+i+1),y(v)));ctx.strokeStyle="#7de0c4";ctx.lineWidth=2.2;ctx.setLineDash([5,4]);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle="#7de0c4";ctx.beginPath();ctx.arc(x(values.length-1),y(values.at(-1)),3.5,0,Math.PI*2);ctx.fill();}ctx.fillStyle="#93a7c0";ctx.font="10px system-ui";ctx.fillText("Historical",pad.l,h-6);if(pred.length)ctx.fillText("Forecast",Math.max(pad.l,w-70),h-6);}
 function renderAnalysis(result,index){if(!result||typeof result!=="object")throw new Error("The analysis response was empty or invalid.");state.currentAnalysis=result;const hist=result.history&&typeof result.history==="object"?result.history:{},close=numericSeries(hist.close),forecast=result.forecast&&typeof result.forecast==="object"?result.forecast:{},pred=numericSeries(forecast.hybrid),quote=result.quote&&typeof result.quote==="object"?result.quote:{};$("detail-company").textContent=result.company||result.ticker||state.ticker;$("detail-price").textContent=money(result.price??quote.price,result.currency||quote.currency);$("detail-change").textContent=pct(result.change_percent??quote.change_percent)+" · "+(result.as_of||quote.as_of||"Latest available");$("detail-change").className="change "+(Number(result.change_percent??quote.change_percent)>=0?"up":"down");$("detail-expected").textContent=pct(forecast.expected_change_percent);$("detail-accuracy").textContent=result.model?.metrics?.backtest?.directional_accuracy==null?"Not measured":(Number(result.model.metrics.backtest.directional_accuracy)*100).toFixed(1)+"%";$("detail-risk").textContent=result.risk?.score==null?"—":Math.round(result.risk.score)+"/100";$("detail-asof").textContent=(result.as_of||"—").slice(0,10);$("stock-data-source").textContent=(result.data_source||index)+" · "+(result.indexed_at||"fresh result");$("history-chart-caption").textContent=(hist.period||index)+" historical prices";$("chart-caption").textContent=(hist.period||index)+" history · "+forecast.horizon+" day indexed prediction";$("forecast-horizon").textContent=(forecast.horizon||30)+" trading days";$("forecast-summary").innerHTML='<strong>'+escapeHTML(pct(forecast.expected_change_percent))+'</strong> modelled change over '+Number(forecast.horizon||30)+' trading days. <span class="muted">Forecast range: '+escapeHTML(money(forecast.lower_bound?.at(-1),result.currency))+' to '+escapeHTML(money(forecast.upper_bound?.at(-1),result.currency))+'</span><br><br>Model outputs are uncertain and can change as new data arrives.';$("model-version").textContent=result.model?.version||index;$("model-diagnostics").innerHTML='Primary hybrid: <strong>'+escapeHTML(result.model?.primary||"Adaptive ensemble")+'</strong><br>Original estimators: '+(result.model?.original_count||0)+' · Hybrids: '+(result.model?.hybrid_count||0)+' · Meta-hybrids: '+(result.model?.meta_count||0)+'<br>Data points: '+close.length+' · Shared learning observations: '+(result.model?.learning_observations||0);const cards=result.model?.candidates||[];const facts=result.fundamentals||{};$("company-fundamentals").innerHTML=[["Sector",facts.sector||"—"],["Market cap",facts.market_cap?money(facts.market_cap,result.currency):"—"],["Trailing P/E",facts.trailing_pe??"—"],["Profit margin",facts.profit_margin==null?"—":(Number(facts.profit_margin)*100).toFixed(1)+"%"]].map(x=>'<div class="detail-stat"><span>'+escapeHTML(x[0])+'</span><strong>'+escapeHTML(x[1])+'</strong></div>').join("");$("model-count").textContent=cards.length+" candidate models";$("model-cards").innerHTML=cards.map(m=>'<article class="model-card"><strong>'+escapeHTML(m.name)+'</strong><p>'+escapeHTML(m.type||"Forecast candidate")+' · '+(m.validation_accuracy==null?"Validation pending":(100*m.validation_accuracy).toFixed(1)+"% directional validation")+'</p><div class="progress"><i style="width:'+Math.max(0,Math.min(100,100*(m.weight||0)))+'%"></i></div></article>').join("")||'<div class="empty">No candidate diagnostics returned.</div>';drawBigChart("history-chart",close,[]);drawBigChart("stock-chart",close.slice(-120),pred);}
 window.addEventListener("resize",()=>{if(state.currentAnalysis){drawBigChart("history-chart",state.currentAnalysis.history?.close||[],[]);drawBigChart("stock-chart",(state.currentAnalysis.history?.close||[]).slice(-120),state.currentAnalysis.forecast?.hybrid||[]);}renderMiniCharts();});
-async function loadWatchlist(){if(!state.user){$("watchlist-cards").innerHTML='<div class="empty">Sign in to save and sync your watchlist. <button class="btn primary small" id="watch-signin">Sign in</button></div>';const b=$("watch-signin");if(b)b.addEventListener("click",()=>showAuth("signin"));return;}try{const data=await api("/api/watchlist",{method:"POST",body:JSON.stringify({action:"list"})});state.watchlist=data.items||[];renderCards($("watchlist-cards"),state.watchlist.map(x=>x.analysis?{ticker:x.ticker,...x.analysis,indexer:x.indexer}: {ticker:x.ticker,company:x.ticker}));}catch(e){$("watchlist-cards").innerHTML='<div class="empty">'+escapeHTML(e.message)+'</div>';}}
+async function loadWatchlist(){
+  if(!state.user){state.watchlist=[];renderWatchlistSections();return;}
+  try{
+    const data=await api("/api/watchlist",{method:"POST",body:JSON.stringify({action:"list"})});
+    state.watchlist=data.items||[];
+    renderWatchlistSections();
+  }catch(error){
+    const root=$("watchlist-cards");
+    if(root)root.innerHTML='<div class="empty">'+escapeHTML(error.message)+'</div>';
+    renderWatchlistSections();
+  }
+}
 async function watchAdd(ticker){if(!state.user){showAuth("signin");return;}try{await api("/api/watchlist",{method:"POST",body:JSON.stringify({action:"add",ticker})});toast(ticker+" added to watchlist.");loadWatchlist();}catch(e){toast(e.message);}}
 $("add-watchlist-detail").addEventListener("click",()=>watchAdd(state.ticker));
 $("watch-add").addEventListener("click",()=>{$("ticker-modal").classList.add("open");$("ticker-input").focus();});
 $("ticker-close").addEventListener("click",()=>$("ticker-modal").classList.remove("open"));
 $("ticker-form").addEventListener("submit",async e=>{e.preventDefault();const t=$("ticker-input").value.trim().toUpperCase();await watchAdd(t);$("ticker-modal").classList.remove("open");});
-async function loadJobs(){try{const data=await api("/api/jobs");state.jobs=data.jobs||[];const active=state.jobs.filter(j=>["queued","running"].includes(j.status)).length,completed=state.jobs.filter(j=>j.status==="completed").length,failed=state.jobs.filter(j=>j.status==="failed").length;$("queue-total").textContent=String(state.jobs.length);$("queue-active").textContent=String(active);$("queue-completed").textContent=String(completed);$("queue-failed").textContent=String(failed);$("queue-summary").textContent=active+" active";$("queue-table").innerHTML=state.jobs.map(j=>'<tr data-job-ticker="'+escapeHTML(j.ticker)+'"><td><strong>'+escapeHTML(j.ticker)+'</strong></td><td>'+escapeHTML(j.indexer)+'</td><td><span class="pill '+(j.status==="completed"?"green":j.status==="failed"?"red":"amber")+'">'+escapeHTML(j.status)+'</span></td><td>'+Number(j.progress||0)+'% <div class="progress"><i style="width:'+Number(j.progress||0)+'%"></i></div><small class="muted">'+escapeHTML(j.stage||"")+'</small></td><td>'+new Date(j.updated_at).toLocaleString()+'</td></tr>').join("")||'<tr><td colspan="5" class="empty">No jobs yet.</td></tr>';$("queue-table").querySelectorAll("[data-job-ticker]").forEach(row=>row.addEventListener("click",()=>openStock(row.dataset.jobTicker)));}catch(e){$("queue-table").innerHTML='<tr><td colspan="5" class="empty">'+escapeHTML(e.message)+'</td></tr>';}}
+async function loadJobs(){
+  const results=await Promise.allSettled([api("/api/jobs"),api("/api/queue-status"),api("/api/model-learning?indexer=PreviewIndex"),api("/api/model-learning?indexer=FullIndex")]);
+  if(results[0].status==="rejected"){
+    const message=results[0].reason.message;
+    ["queue-table","home-recent-analyses","discover-recent-analyses","analysis-active-jobs","analysis-failed-jobs","analysis-completed-jobs"].forEach(id=>{const root=$(id);if(root)root.innerHTML='<div class="empty">'+escapeHTML(message)+'</div>';});
+    return;
+  }
+  state.jobs=results[0].value?.jobs||[];
+  state.queueStatus=results[1].status==="fulfilled"?results[1].value:null;
+  state.learning.PreviewIndex=results[2].status==="fulfilled"?results[2].value:null;
+  state.learning.FullIndex=results[3].status==="fulfilled"?results[3].value:null;
+  const jobs=state.jobs;
+  const active=jobs.filter(job=>["queued","running"].includes(job.status));
+  const completed=jobs.filter(job=>job.status==="completed");
+  const failed=jobs.filter(job=>job.status==="failed");
+  setText("queue-total",jobs.length);
+  setText("queue-active",active.length);
+  setText("queue-completed",completed.length);
+  setText("queue-failed",failed.length);
+  setText("queue-summary",active.length+" active · "+jobs.length+" visible jobs");
+  setText("queue-history-count",jobs.length+" visible records");
+  renderJobRows($("home-recent-analyses"),jobs.slice(0,6),"No recent analysis jobs are available.");
+  renderJobRows($("discover-recent-analyses"),jobs.slice(0,8),"No recent analysis jobs are available.");
+  renderJobRows($("analysis-active-jobs"),active.slice(0,8),"There are no active analyses.");
+  renderJobRows($("analysis-failed-jobs"),failed.slice(0,8),"There are no recent failed analyses.");
+  renderJobRows($("analysis-completed-jobs"),completed.slice(0,8),"There are no recently completed analyses.");
+  const counts=state.queueStatus?.counts||{};
+  setText("analysis-week-total",state.queueStatus?.total??"—");
+  setText("analysis-week-active",state.queueStatus?.active??(Number(counts.queued||0)+Number(counts.running||0)));
+  setText("analysis-week-completed",counts.completed??"—");
+  setText("analysis-week-failed",counts.failed??"—");
+  setText("analysis-queue-note",state.queueStatus?"Counts cover the last seven days. The table shows latest records visible to this account.":"Seven-day summary unavailable; recent job results are still shown.");
+  setText("analysis-preview-jobs",jobs.filter(job=>job.indexer==="PreviewIndex").length);
+  setText("analysis-full-jobs",jobs.filter(job=>job.indexer==="FullIndex").length);
+  setText("analysis-scan-jobs",jobs.filter(job=>job.job_type==="scan").length);
+  setText("analysis-pending-jobs",active.length);
+  renderLearningPanel($("analysis-learning-preview"),state.learning.PreviewIndex);
+  renderLearningPanel($("analysis-learning-full"),state.learning.FullIndex);
+  const updates=[state.learning.PreviewIndex?.updated_at,state.learning.FullIndex?.updated_at].filter(Boolean).sort();
+  setText("analysis-learning-updated",updates.length?"Updated "+formatWhen(updates[updates.length-1]):"No learning timestamp returned");
+  const table=$("queue-table");
+  if(table){
+    table.innerHTML=jobs.map(job=>'<tr data-job-ticker="'+escapeHTML(job.ticker)+'" tabindex="0" role="button"><td><strong>'+escapeHTML(job.ticker)+'</strong></td><td>'+escapeHTML(job.indexer||"—")+'</td><td><span class="pill '+(job.status==="completed"?"green":job.status==="failed"?"red":"amber")+'">'+escapeHTML(job.status)+'</span></td><td>'+Number(job.progress||0)+'% <div class="progress"><i style="width:'+Math.max(0,Math.min(100,Number(job.progress||0)))+'%"></i></div><small class="muted">'+escapeHTML(job.stage||"")+'</small></td><td>'+escapeHTML(formatWhen(job.updated_at))+'</td></tr>').join("")||'<tr><td colspan="5" class="empty">No jobs yet.</td></tr>';
+    table.querySelectorAll("[data-job-ticker]").forEach(row=>{
+      const open=()=>openStock(row.dataset.jobTicker);
+      row.addEventListener("click",open);
+      row.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();open();}});
+    });
+  }
+}
 $("queue-refresh").addEventListener("click",loadJobs);
+async function loadSettingsData(){
+  const results=await Promise.allSettled([api("/api/health"),api("/api/indexed-stats")]);
+  if(results[0].status==="fulfilled"){
+    setText("settings-db-status",results[0].value.database||"Unknown");
+    setText("settings-queue-status",results[0].value.queue||"Unknown");
+  }else{
+    setText("settings-db-status","Unavailable");
+    setText("settings-queue-status","Health check failed");
+  }
+  if(results[1].status==="fulfilled"){
+    state.indexStats=results[1].value;
+    const stats=state.indexStats;
+    setText("settings-tracked-count",stats.tracked??"—");
+    setText("settings-preview-count",(stats.preview?.tickers??"—")+" instruments · "+(stats.preview?.records??"—")+" records");
+    setText("settings-full-count",(stats.full?.tickers??"—")+" instruments · "+(stats.full?.records??"—")+" records");
+    setText("settings-index-updated","PreviewIndex latest: "+formatWhen(stats.preview?.latest)+" · FullIndex latest: "+formatWhen(stats.full?.latest));
+    renderMarketSections();
+  }else{
+    setText("settings-tracked-count","Unavailable");
+    setText("settings-preview-count","Unavailable");
+    setText("settings-full-count","Unavailable");
+  }
+  setText("settings-data-source",state.marketMeta?.stale?"The interface is showing a saved market snapshot.":"Latest feed refresh: "+formatWhen(state.marketMeta?.generated_at));
+}
 async function runSearch(raw){const term=String(raw||"").trim().toUpperCase();if(!term)return;if(/^[A-Z0-9.^=-]{1,20}$/.test(term)){openStock(term,"PreviewIndex");return;}try{const results=await api("/api/market-feed?q="+encodeURIComponent(term));$("search-results").innerHTML=(results.suggestions||[]).map(x=>'<div class="feed-row" data-ticker="'+escapeHTML(x.symbol)+'"><div>⌕</div><div><div class="feed-symbol">'+escapeHTML(x.symbol)+'</div><div class="feed-company">'+escapeHTML(x.name||"")+'</div></div><div class="muted">'+escapeHTML(x.exchange||"")+'</div></div>').join("")||'<div class="empty">No matching tickers found.</div>';$("search-results").querySelectorAll("[data-ticker]").forEach(el=>{el.setAttribute("role","button");el.tabIndex=0;el.addEventListener("click",()=>openStock(el.dataset.ticker));el.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();openStock(el.dataset.ticker);}});});}catch(e){toast(e.message);}}
 $("ticker-search").addEventListener("keydown",e=>{if(e.key==="Enter")runSearch(e.target.value);});
 $("discover-go").addEventListener("click",()=>runSearch($("discover-search").value));
@@ -322,7 +587,13 @@ $("discover-search").addEventListener("keydown",e=>{if(e.key==="Enter")runSearch
 $("back-market").addEventListener("click",()=>setPage("discover"));
 $("watchlist-cards").addEventListener("click",e=>{const card=e.target.closest("[data-ticker]");if(card&&e.target.closest(".remove-watch"))return;});
 $("add-watchlist-detail").addEventListener("contextmenu",e=>e.preventDefault());
-async function init(){await restoreSession();await Promise.allSettled([loadMarket(),loadWatchlist()]);state.marketTimer=setInterval(()=>loadMarket(),90000);}
+async function init(){
+  restoreMarketSnapshot();
+  await restoreSession();
+  await Promise.allSettled([loadMarket(),loadWatchlist(),loadJobs(),loadSettingsData()]);
+  refreshMarketScan(null);
+  state.marketTimer=setInterval(()=>loadMarket(),90000);
+}
 init();
 })();
 </script>
