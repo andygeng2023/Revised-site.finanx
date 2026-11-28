@@ -623,9 +623,435 @@ async function openStock(ticker,index){ticker=String(ticker||"").toUpperCase().t
 function updateIndexButtons(){document.querySelectorAll("[data-index]").forEach(b=>b.classList.toggle("active",b.dataset.index===state.index));}
 async function loadStockIndex(index){clearTimeout(state.pollTimer);state.analysisRequest=null;state.index=index;const ticker=state.ticker,token=++state.loadToken;updateIndexButtons();$("detail-job-status").textContent="Checking cache";$("detail-stage").textContent="Checking "+index+" availability…";$("stock-data-source").textContent=index+" selected";try{const availability=await api("/api/index-availability?ticker="+encodeURIComponent(ticker));if(state.ticker!==ticker||state.index!==index||state.loadToken!==token)return;const found=(availability.indexes||[]).find(x=>x.id===index);if(found){$("detail-stage").textContent="Loading "+index+" cached analysis.";const result=await api("/api/stock-market-data?ticker="+encodeURIComponent(ticker)+"&indexer="+encodeURIComponent(index));if(state.ticker!==ticker||state.index!==index||state.loadToken!==token)return;if(result.analysis){renderAnalysis(result.analysis,index);$("detail-job-status").textContent="Cached analysis";$("detail-stage").textContent="Loaded shared "+index+" result.";return;}}$("detail-stage").textContent="No fresh cache. Starting "+index+" analysis…";const job=await api("/api/request-analysis",{method:"POST",body:JSON.stringify({ticker,save_to_indexer:index,mode:"analysis"})});if(state.ticker!==ticker||state.index!==index||state.loadToken!==token)return;if(job.status==="completed"&&job.result){renderAnalysis(job.result,index);}else{showJob(job.id,ticker,index);}}catch(e){if(state.ticker!==ticker||state.index!==index||state.loadToken!==token)return;$("detail-stage").textContent=e.message;$("detail-job-status").textContent="Request failed";toast(e.message);}}
 document.querySelectorAll("[data-index]").forEach(b=>b.addEventListener("click",()=>{if(state.ticker&&state.index!==b.dataset.index)loadStockIndex(b.dataset.index);}));
-function drawBigChart(canvasId,history,forecast){const c=$(canvasId);if(!c)return;const ctx=c.getContext("2d");if(!ctx)return;const box=c.getBoundingClientRect(),w=Math.max(1,Math.floor(box.width||c.parentElement?.clientWidth||320)),h=Math.max(170,Math.floor(box.height||250)),dpr=Math.min(window.devicePixelRatio||1,2);c.width=Math.round(w*dpr);c.height=Math.round(h*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);const hist=numericSeries(history),pred=numericSeries(forecast),values=hist.concat(pred);ctx.fillStyle="#8fa5bf";ctx.font="12px system-ui";if(hist.length<2){ctx.fillText("Historical price data is not available.",15,35);return;}const min=Math.min(...values),max=Math.max(...values),range=max-min||1,pad={l:12,r:12,t:14,b:25},x=i=>pad.l+i/Math.max(1,values.length-1)*(w-pad.l-pad.r),y=v=>h-pad.b-(v-min)/range*(h-pad.t-pad.b);ctx.strokeStyle="rgba(125,153,185,.18)";ctx.lineWidth=1;for(let i=0;i<4;i++){const gy=pad.t+i*(h-pad.t-pad.b)/3;ctx.beginPath();ctx.moveTo(pad.l,gy);ctx.lineTo(w-pad.r,gy);ctx.stroke();}ctx.beginPath();hist.forEach((v,i)=>i?ctx.lineTo(x(i),y(v)):ctx.moveTo(x(i),y(v)));ctx.strokeStyle="#9abaff";ctx.lineWidth=2;ctx.setLineDash([]);ctx.stroke();if(pred.length){const start=hist.length-1;ctx.beginPath();ctx.moveTo(x(start),y(hist.at(-1)));pred.forEach((v,i)=>ctx.lineTo(x(start+i+1),y(v)));ctx.strokeStyle="#7de0c4";ctx.lineWidth=2.2;ctx.setLineDash([5,4]);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle="#7de0c4";ctx.beginPath();ctx.arc(x(values.length-1),y(values.at(-1)),3.5,0,Math.PI*2);ctx.fill();}ctx.fillStyle="#93a7c0";ctx.font="10px system-ui";ctx.fillText("Historical",pad.l,h-6);if(pred.length)ctx.fillText("Forecast",Math.max(pad.l,w-70),h-6);}
-function renderAnalysis(result,index){if(!result||typeof result!=="object")throw new Error("The analysis response was empty or invalid.");state.currentAnalysis=result;renderAnalysisNews(result.news_context);const hist=result.history&&typeof result.history==="object"?result.history:{},close=numericSeries(hist.close),forecast=result.forecast&&typeof result.forecast==="object"?result.forecast:{},pred=numericSeries(forecast.hybrid),quote=result.quote&&typeof result.quote==="object"?result.quote:{};$("detail-company").textContent=result.company||result.ticker||state.ticker;$("detail-price").textContent=money(result.price??quote.price,result.currency||quote.currency);$("detail-change").textContent=pct(result.change_percent??quote.change_percent)+" · "+(result.as_of||quote.as_of||"Latest available");$("detail-change").className="change "+(Number(result.change_percent??quote.change_percent)>=0?"up":"down");$("detail-expected").textContent=pct(forecast.expected_change_percent);$("detail-accuracy").textContent=result.model?.metrics?.backtest?.directional_accuracy==null?"Not measured":(Number(result.model.metrics.backtest.directional_accuracy)*100).toFixed(1)+"%";$("detail-risk").textContent=result.risk?.score==null?"—":Math.round(result.risk.score)+"/100";$("detail-asof").textContent=(result.as_of||"—").slice(0,10);$("stock-data-source").textContent=(result.data_source||index)+" · "+(result.indexed_at||"fresh result");$("history-chart-caption").textContent=(hist.period||index)+" historical prices";$("chart-caption").textContent=(hist.period||index)+" history · "+forecast.horizon+" day indexed prediction";$("forecast-horizon").textContent=(forecast.horizon||30)+" trading days";$("forecast-summary").innerHTML='<strong>'+escapeHTML(pct(forecast.expected_change_percent))+'</strong> modelled change over '+Number(forecast.horizon||30)+' trading days. <span class="muted">Forecast range: '+escapeHTML(money(forecast.lower_bound?.at(-1),result.currency))+' to '+escapeHTML(money(forecast.upper_bound?.at(-1),result.currency))+'</span><br><br>Model outputs are uncertain and can change as new data arrives.';$("model-version").textContent=result.model?.version||index;$("model-diagnostics").innerHTML='Primary hybrid: <strong>'+escapeHTML(result.model?.primary||"Adaptive ensemble")+'</strong><br>Original estimators: '+(result.model?.original_count||0)+' · Hybrids: '+(result.model?.hybrid_count||0)+' · Meta-hybrids: '+(result.model?.meta_count||0)+'<br>Data points: '+close.length+' · Shared learning observations: '+(result.model?.learning_observations||0);const cards=result.model?.candidates||[];const facts=result.fundamentals||{};$("company-fundamentals").innerHTML=[["Sector",facts.sector||"—"],["Market cap",facts.market_cap?money(facts.market_cap,result.currency):"—"],["Trailing P/E",facts.trailing_pe??"—"],["Profit margin",facts.profit_margin==null?"—":(Number(facts.profit_margin)*100).toFixed(1)+"%"]].map(x=>'<div class="detail-stat"><span>'+escapeHTML(x[0])+'</span><strong>'+escapeHTML(x[1])+'</strong></div>').join("");$("model-count").textContent=cards.length+" candidate models";$("model-cards").innerHTML=cards.map(m=>'<article class="model-card"><strong>'+escapeHTML(m.name)+'</strong><p>'+escapeHTML(m.type||"Forecast candidate")+' · '+(m.validation_accuracy==null?"Validation pending":(100*m.validation_accuracy).toFixed(1)+"% directional validation")+'</p><div class="progress"><i style="width:'+Math.max(0,Math.min(100,100*(m.weight||0)))+'%"></i></div></article>').join("")||'<div class="empty">No candidate diagnostics returned.</div>';drawBigChart("history-chart",close,[]);drawBigChart("stock-chart",close.slice(-120),pred);}
-window.addEventListener("resize",()=>{if(state.currentAnalysis){drawBigChart("history-chart",state.currentAnalysis.history?.close||[],[]);drawBigChart("stock-chart",(state.currentAnalysis.history?.close||[]).slice(-120),state.currentAnalysis.forecast?.hybrid||[]);}renderMiniCharts();});
+const STOCK_MODEL_COLORS=["#91b7ff","#86d8c2","#d5a8ff","#e5bd7a","#7cc8e8","#ee9b9b","#a8d78b","#b4a7ef","#f0b0da","#83c5b4","#c7d78b","#9eb5e9","#e6a987","#8bd0d9","#d0a4f0"];
+const STOCK_PERIOD_COUNTS={"1M":22,"1Q":63,"6M":126,"1Y":252,"5Y":1260};
+function historyRowsFromResult(hist){
+  const dates=Array.isArray(hist?.dates)?hist.dates:[];
+  return dates.map((date,i)=>({
+    date,open:hist.open?.[i]??null,high:hist.high?.[i]??null,low:hist.low?.[i]??null,
+    close:Number(hist.close?.[i]),volume:hist.volume?.[i]??null
+  })).filter(row=>Number.isFinite(row.close)&&row.close>0);
+}
+function forecastTradingDates(lastDate,horizon){
+  const result=[],date=new Date(lastDate||Date.now());
+  if(Number.isNaN(date.getTime()))date.setTime(Date.now());
+  while(result.length<horizon){
+    date.setUTCDate(date.getUTCDate()+1);
+    if(date.getUTCDay()===0||date.getUTCDay()===6)continue;
+    result.push(date.toISOString());
+  }
+  return result;
+}
+function buildStockModelSeries(result,lastPrice){
+  const candidates=Array.isArray(result.model?.candidates)?result.model.candidates:[];
+  const horizon=Math.max(1,Number(result.forecast?.horizon||30));
+  return candidates.map((candidate,index)=>{
+    const key=String(candidate.key||"model-"+index);
+    let values=[];
+    if(key==="primary"&&Array.isArray(result.forecast?.hybrid)){
+      values=numericSeries(result.forecast.hybrid);
+    }else{
+      const signal=Math.max(-.025,Math.min(.025,Number(candidate.signal||0)));
+      let cumulative=0;
+      for(let step=1;step<=horizon;step++){
+        cumulative+=signal*Math.pow(.965,step-1);
+        values.push(Number((lastPrice*Math.exp(cumulative)).toFixed(4)));
+      }
+    }
+    const color=key==="primary"?"#78e0c2":candidate.type==="Meta-hybrid"?"#e5bd7a":STOCK_MODEL_COLORS[index%STOCK_MODEL_COLORS.length];
+    return {key,name:candidate.name||key,type:candidate.type||"Original",signal:Number(candidate.signal||0),values,color,validation_accuracy:candidate.validation_accuracy,mae:candidate.mae,observations:candidate.observations,weight:candidate.weight};
+  }).filter(series=>series.values.length);
+}
+function stockChartConfig(id){return state.stockChart?.charts?.[id]||null;}
+function stockRowsForPeriod(period,stock){
+  if(["1D","1W","MAX"].includes(period)&&stock.specialRows?.[period]?.length)return stock.specialRows[period];
+  if(period==="1D"||period==="1W"||period==="MAX")return stock.baseRows;
+  const count=STOCK_PERIOD_COUNTS[period];
+  return count?stock.baseRows.slice(-count):stock.baseRows;
+}
+function stockFormatDate(value,withTime){
+  if(!value)return "—";
+  const date=new Date(value);
+  if(Number.isNaN(date.getTime()))return String(value);
+  return withTime
+    ? date.toLocaleString([],{dateStyle:"medium",timeStyle:"short"})
+    : date.toLocaleDateString([],{day:"2-digit",month:"short",year:"2-digit"});
+}
+function stockAxisValue(value,currency){
+  if(!Number.isFinite(value))return "—";
+  const compact=new Intl.NumberFormat(undefined,{notation:"compact",maximumFractionDigits:2}).format(value);
+  return currency==="USD"?"$"+compact:compact+" "+(currency||"");
+}
+function stockPeriodCaption(period){
+  return ({"1D":"Today","1W":"Last five trading days","1M":"One month","1Q":"One quarter","6M":"Six months","1Y":"One year","5Y":"Five years","MAX":"Maximum available history"})[period]||period;
+}
+function stockSeriesValue(series,index){
+  const offset=index;
+  return offset>=0&&offset<series.values.length?series.values[offset]:null;
+}
+function syncStockRangeRails(id){
+  const config=stockChartConfig(id);if(!config)return;
+  document.querySelectorAll('[data-chart-id="'+id+'"][data-chart-axis]').forEach(rail=>{
+    const selected=rail.querySelector(".chart-range-selected"),low=rail.querySelector('[data-range-edge="low"]'),high=rail.querySelector('[data-range-edge="high"]');
+    if(rail.dataset.chartAxis==="x"){
+      const left=config.xStart*100,width=(config.xEnd-config.xStart)*100;
+      if(selected){selected.style.left=left+"%";selected.style.width=width+"%";}
+      if(low)low.style.left=config.xStart*100+"%";
+      if(high)high.style.left=config.xEnd*100+"%";
+    }else{
+      const top=(1-config.yHigh)*100,height=(config.yHigh-config.yLow)*100;
+      if(selected){selected.style.top=top+"%";selected.style.height=height+"%";}
+      if(low)low.style.top=(1-config.yLow)*100+"%";
+      if(high)high.style.top=(1-config.yHigh)*100+"%";
+    }
+  });
+}
+function renderStockInspect(id,index){
+  const config=stockChartConfig(id),meta=config?.meta;
+  const root=$(id==="history"?"history-inspect":"forecast-inspect");
+  if(!root||!meta)return;
+  const rowIndex=Math.max(0,Math.min(meta.total-1,index));
+  const valueRows=[];
+  if(id==="history"||rowIndex<meta.historyLength){
+    const row=meta.rows[Math.min(rowIndex,meta.rows.length-1)];
+    if(!row){root.textContent="No point data is available.";return;}
+    const date=stockFormatDate(row.date,String(row.date||"").includes("T"));
+    const fields=[["Open",row.open],["High",row.high],["Low",row.low],["Close",row.close],["Volume",row.volume]];
+    root.innerHTML="<strong>"+escapeHTML(date)+"</strong>"+fields.map(([label,value])=>"<span>"+label+" <b>"+(label==="Volume"?(value==null?"—":compactNumber(value)):money(value,state.currentAnalysis?.currency))+"</b></span>").join("");
+    return;
+  }
+  const futureIndex=rowIndex-meta.historyLength;
+  const date=stockFormatDate(meta.futureDates[futureIndex],false);
+  const primary=meta.series.find(series=>series.key==="primary");
+  const low=meta.forecast.lower_bound?.[futureIndex],high=meta.forecast.upper_bound?.[futureIndex];
+  const values=(meta.series||[]).filter(series=>config.modelVisibility[series.key]!==false)
+    .filter(series=>series.key==="primary"||series.type==="Meta-hybrid"||series.type==="Hybrid")
+    .slice(0,7)
+    .map(series=>"<span>"+escapeHTML(series.name)+" <b>"+money(stockSeriesValue(series,futureIndex),state.currentAnalysis?.currency)+"</b></span>");
+  root.innerHTML="<strong>"+escapeHTML(date)+" · Forecast</strong><span>Primary <b>"+money(stockSeriesValue(primary||{values:[]},futureIndex),state.currentAnalysis?.currency)+"</b></span>"+
+    "<span>Range <b>"+money(low,state.currentAnalysis?.currency)+" – "+money(high,state.currentAnalysis?.currency)+"</b></span>"+values.join("");
+}
+function drawStockChart(id){
+  const canvas=$(id==="history"?"history-chart":"stock-chart"),stock=state.stockChart,config=stockChartConfig(id);
+  if(!canvas||!stock||!config)return;
+  const ctx=canvas.getContext("2d");if(!ctx)return;
+  const box=canvas.getBoundingClientRect(),w=Math.max(1,Math.floor(box.width||canvas.parentElement?.clientWidth||320)),h=Math.max(170,Math.floor(box.height||260)),dpr=Math.min(window.devicePixelRatio||1,2);
+  canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+  const rows=stockRowsForPeriod(config.period,stock),historyLength=rows.length;
+  if(historyLength<2){ctx.fillStyle="#8fa5bf";ctx.font="12px system-ui";ctx.fillText("Historical price data is not available.",14,30);return;}
+  const futureDates=forecastTradingDates(rows.at(-1)?.date,stock.forecast.horizon);
+  const total=id==="forecast"?historyLength+stock.forecast.horizon:historyLength;
+  const from=Math.max(0,Math.min(total-2,Math.floor(config.xStart*(total-1))));
+  const to=Math.max(from+1,Math.min(total-1,Math.ceil(config.xEnd*(total-1))));
+  const visibleModels=stock.series.filter(series=>config.modelVisibility[series.key]!==false);
+  const values=[];
+  for(let i=from;i<=to;i++){
+    if(i<historyLength){if(Number.isFinite(rows[i].close))values.push(rows[i].close);}
+    else{
+      const offset=i-historyLength;
+      visibleModels.forEach(series=>{const v=series.values[offset];if(Number.isFinite(v))values.push(v);});
+      const lo=stock.forecast.lower_bound?.[offset],hi=stock.forecast.upper_bound?.[offset];
+      if(Number.isFinite(lo))values.push(lo);if(Number.isFinite(hi))values.push(hi);
+    }
+  }
+  if(values.length<2){ctx.fillStyle="#8fa5bf";ctx.font="12px system-ui";ctx.fillText("Not enough chart data.",14,30);return;}
+  const fullMin=Math.min(...values),fullMax=Math.max(...values),fullRange=fullMax-fullMin||Math.max(Math.abs(fullMax)*.01,1);
+  const yMin=fullMin+fullRange*config.yLow,yMax=fullMin+fullRange*config.yHigh,yRange=yMax-yMin||1;
+  const pad={l:66,r:14,t:17,b:30},plotW=w-pad.l-pad.r,plotH=h-pad.t-pad.b;
+  const x=i=>pad.l+(i-from)/Math.max(1,to-from)*plotW;
+  const y=v=>pad.t+(yMax-v)/yRange*plotH;
+  ctx.font="10px system-ui";ctx.lineWidth=1;
+  for(let i=0;i<=4;i++){
+    const value=yMin+(yRange*i/4),gy=y(value);
+    ctx.strokeStyle="rgba(143,171,204,.14)";ctx.beginPath();ctx.moveTo(pad.l,gy);ctx.lineTo(w-pad.r,gy);ctx.stroke();
+    ctx.fillStyle="#8198b2";ctx.textAlign="right";ctx.fillText(stockAxisValue(value,state.currentAnalysis?.currency),pad.l-9,gy+3);
+  }
+  ctx.strokeStyle="rgba(143,171,204,.25)";ctx.beginPath();ctx.moveTo(pad.l,pad.t);ctx.lineTo(pad.l,h-pad.b);ctx.lineTo(w-pad.r,h-pad.b);ctx.stroke();
+  for(let tick=0;tick<=4;tick++){
+    const idx=Math.round(from+(to-from)*tick/4),label=idx<historyLength?rows[idx]?.date:futureDates[idx-historyLength];
+    ctx.fillStyle="#8198b2";ctx.textAlign=tick===0?"left":tick===4?"right":"center";
+    ctx.fillText(stockFormatDate(label,String(label||"").includes("T")),x(idx),h-8);
+  }
+  if(id==="forecast"&&stock.forecast.lower_bound?.length){
+    ctx.beginPath();let started=false;
+    for(let i=Math.max(from,historyLength);i<=to;i++){
+      const offset=i-historyLength,upper=stock.forecast.upper_bound[offset];
+      if(!Number.isFinite(upper))continue;
+      if(!started){ctx.moveTo(x(i),y(upper));started=true;}else ctx.lineTo(x(i),y(upper));
+    }
+    for(let i=to;i>=Math.max(from,historyLength);i--){
+      const offset=i-historyLength,lower=stock.forecast.lower_bound[offset];
+      if(Number.isFinite(lower))ctx.lineTo(x(i),y(lower));
+    }
+    if(started){ctx.closePath();ctx.fillStyle="rgba(120,224,194,.11)";ctx.fill();}
+  }
+  if(rows.length<190){
+    ctx.strokeStyle="rgba(154,186,255,.26)";ctx.lineWidth=1;
+    for(let i=Math.max(from,0);i<=Math.min(to,historyLength-1);i++){
+      const row=rows[i];if(!Number.isFinite(row.high)||!Number.isFinite(row.low))continue;
+      ctx.beginPath();ctx.moveTo(x(i),y(row.high));ctx.lineTo(x(i),y(row.low));ctx.stroke();
+    }
+  }
+  ctx.beginPath();let startedHistory=false;
+  for(let i=Math.max(from,0);i<=Math.min(to,historyLength-1);i++){
+    const value=rows[i].close;if(!Number.isFinite(value))continue;
+    if(!startedHistory){ctx.moveTo(x(i),y(value));startedHistory=true;}else ctx.lineTo(x(i),y(value));
+  }
+  ctx.strokeStyle="#9abaff";ctx.lineWidth=2;ctx.lineJoin="round";ctx.lineCap="round";ctx.stroke();
+  if(id==="history"&&startedHistory&&to>from){
+    ctx.lineTo(x(Math.min(to,historyLength-1)),h-pad.b);ctx.lineTo(x(Math.max(from,0)),h-pad.b);ctx.closePath();
+    const gradient=ctx.createLinearGradient(0,pad.t,0,h-pad.b);gradient.addColorStop(0,"rgba(154,186,255,.14)");gradient.addColorStop(1,"rgba(154,186,255,0)");
+    ctx.fillStyle=gradient;ctx.fill();
+  }
+  if(id==="forecast"){
+    for(const series of visibleModels){
+      ctx.beginPath();let started=false;
+      for(let i=Math.max(from,historyLength-1);i<=to;i++){
+        const offset=i-historyLength,point=i===historyLength-1?rows.at(-1)?.close:series.values[offset];
+        if(!Number.isFinite(point))continue;
+        if(!started){ctx.moveTo(x(i),y(point));started=true;}else ctx.lineTo(x(i),y(point));
+      }
+      ctx.strokeStyle=series.color;ctx.lineWidth=series.key==="primary"?2.8:series.type==="Meta-hybrid"?1.8:series.type==="Hybrid"?1.45:1.05;
+      ctx.globalAlpha=series.key==="primary"?1:series.type==="Original"?.54:.82;
+      ctx.setLineDash(series.key==="primary"?[]:series.type==="Original"?[2,3]:[]);
+      ctx.stroke();ctx.globalAlpha=1;ctx.setLineDash([]);
+    }
+  }
+  if(config.selectedIndex!=null&&config.selectedIndex>=from&&config.selectedIndex<=to){
+    const index=config.selectedIndex,px=x(index);
+    let point=index<historyLength?rows[index]?.close:null;
+    if(id==="forecast"&&index>=historyLength){const selected=stock.series.find(series=>series.key==="primary");point=selected?.values[index-historyLength];}
+    if(Number.isFinite(point)){
+      ctx.strokeStyle="rgba(231,241,255,.58)";ctx.lineWidth=1;ctx.setLineDash([3,4]);ctx.beginPath();ctx.moveTo(px,pad.t);ctx.lineTo(px,h-pad.b);ctx.stroke();ctx.setLineDash([]);
+      ctx.fillStyle="#eef5ff";ctx.beginPath();ctx.arc(px,y(point),4,0,Math.PI*2);ctx.fill();
+    }
+  }
+  config.meta={rows,historyLength,total,from,to,futureDates,series:stock.series,forecast:stock.forecast};
+  syncStockRangeRails(id);
+}
+function renderStockModelKey(series){
+  const root=$("forecast-model-key");if(!root)return;
+  root.innerHTML=series.map(item=>'<button type="button" class="model-key-item" data-model-key="'+escapeHTML(item.key)+'" aria-pressed="true"><i class="model-key-swatch" style="background:'+escapeHTML(item.color)+'"></i>'+escapeHTML(item.name)+'</button>').join("")||'<div class="empty">No model projections available.</div>';
+  root.querySelectorAll("[data-model-key]").forEach(button=>button.addEventListener("click",()=>{
+    const config=stockChartConfig("forecast"),key=button.dataset.modelKey;
+    if(!config)return;
+    config.modelVisibility[key]=config.modelVisibility[key]===false;
+    button.setAttribute("aria-pressed",String(config.modelVisibility[key]!==false));
+    drawStockChart("forecast");
+  }));
+}
+function compactNumber(value){
+  if(value==null||!Number.isFinite(Number(value)))return "—";
+  return new Intl.NumberFormat(undefined,{notation:"compact",maximumFractionDigits:2}).format(Number(value));
+}
+function realisedVolatility(rows,windowSize){
+  const closes=rows.slice(-windowSize-1).map(row=>Number(row.close)).filter(value=>value>0),returns=[];
+  for(let i=1;i<closes.length;i++)returns.push(Math.log(closes[i]/closes[i-1]));
+  if(returns.length<3)return null;
+  const average=returns.reduce((sum,value)=>sum+value,0)/returns.length;
+  const deviation=Math.sqrt(returns.reduce((sum,value)=>sum+(value-average)**2,0)/returns.length);
+  return deviation*Math.sqrt(252)*100;
+}
+function renderStockMetrics(result,rows){
+  const root=$("market-metrics");if(!root)return;
+  const year=rows.slice(-252),latest=rows.at(-1),previous=rows.at(-2),closes=year.map(row=>row.close).filter(Number.isFinite);
+  const highs=year.map(row=>Number(row.high??row.close)).filter(Number.isFinite),lows=year.map(row=>Number(row.low??row.close)).filter(Number.isFinite);
+  const returns=closes.length>1?100*(closes.at(-1)/closes[0]-1):null;
+  const avgVolume=rows.slice(-20).map(row=>Number(row.volume)).filter(value=>Number.isFinite(value)&&value>0);
+  const volumeAverage=avgVolume.length?avgVolume.reduce((sum,value)=>sum+value,0)/avgVolume.length:null;
+  const dayRange=latest&&Number.isFinite(latest.high)&&Number.isFinite(latest.low)?money(latest.low,result.currency)+" – "+money(latest.high,result.currency):"—";
+  const facts=result.fundamentals||{},risk=result.risk||{};
+  const metrics=[
+    ["Annualised volatility",risk.annualized_volatility==null?"—":Number(risk.annualized_volatility).toFixed(2)+"%"],
+    ["20-day realised volatility",realisedVolatility(rows,20)==null?"—":realisedVolatility(rows,20).toFixed(2)+"%"],
+    ["52-week high",highs.length?money(Math.max(...highs),result.currency):"—"],
+    ["52-week low",lows.length?money(Math.min(...lows),result.currency):"—"],
+    ["Daily trading range",dayRange],
+    ["Current volume",latest?.volume==null?"—":compactNumber(latest.volume)],
+    ["20-day average volume",volumeAverage==null?"—":compactNumber(volumeAverage)],
+    ["52-week return",returns==null?"—":pct(returns)],
+    ["Maximum 52-week drawdown",risk.recent_drawdown==null?"—":pct(risk.recent_drawdown)],
+    ["Relative strength index",risk.rsi==null?"—":Number(risk.rsi).toFixed(1)],
+    ["Beta",facts.beta==null?"—":Number(facts.beta).toFixed(2)],
+    ["Market capitalisation",facts.market_cap==null?"—":money(facts.market_cap,result.currency)],
+    ["Trailing P/E",facts.trailing_pe==null?"—":Number(facts.trailing_pe).toFixed(2)],
+    ["Forward P/E",facts.forward_pe==null?"—":Number(facts.forward_pe).toFixed(2)]
+  ];
+  root.innerHTML=metrics.map(([label,value])=>'<div class="market-metric"><span>'+escapeHTML(label)+'</span><strong>'+escapeHTML(value)+'</strong></div>').join("");
+}
+function companyFact(label,value){
+  return '<div class="company-fact"><span>'+escapeHTML(label)+'</span><strong>'+escapeHTML(value==null||value===""?"—":String(value))+'</strong></div>';
+}
+function percentFact(value){
+  return value==null?"—":(Number(value)*100).toFixed(2)+"%";
+}
+function renderCompanyProfile(result){
+  const facts=result.fundamentals||{},description=$("company-description");
+  if(description)description.textContent=facts.description||"A full business description is not currently available from the data provider.";
+  const tags=[facts.sector,facts.industry,result.exchange].filter(Boolean);
+  const classification=$("company-classification");
+  if(classification)classification.innerHTML=tags.map(value=>'<span class="pill">'+escapeHTML(value)+'</span>').join("");
+  const root=$("company-fundamentals");if(!root)return;
+  const items=[
+    ["Market capitalisation",facts.market_cap==null?"—":money(facts.market_cap,result.currency)],
+    ["Enterprise value",facts.enterprise_value==null?"—":money(facts.enterprise_value,result.currency)],
+    ["Trailing P/E",facts.trailing_pe],["Forward P/E",facts.forward_pe],
+    ["Price / sales",facts.price_to_sales],["Book value per share",facts.book_value],
+    ["Profit margin",percentFact(facts.profit_margin)],["Return on equity",percentFact(facts.return_on_equity)],
+    ["Dividend yield",percentFact(facts.dividend_yield)],["Beta",facts.beta==null?"—":Number(facts.beta).toFixed(2)],
+    ["Full-time employees",facts.employees==null?"—":compactNumber(facts.employees)],
+    ["Revenue growth",percentFact(facts.revenue_growth)],["Earnings growth",percentFact(facts.earnings_growth)],
+    ["Debt / equity",facts.debt_to_equity],["Current ratio",facts.current_ratio],
+    ["Free cash flow",facts.free_cash_flow==null?"—":money(facts.free_cash_flow,result.currency)],
+    ["Operating cash flow",facts.operating_cash_flow==null?"—":money(facts.operating_cash_flow,result.currency)]
+  ];
+  root.innerHTML=items.map(([label,value])=>companyFact(label,value)).join("");
+  if(facts.website){
+    try{
+      const url=new URL(facts.website.startsWith("http")?facts.website:"https://"+facts.website);
+      if(url.protocol==="https:"){
+        classification.innerHTML+=(classification.innerHTML?"":"")+'<a class="pill" href="'+escapeHTML(url.href)+'" target="_blank" rel="noopener noreferrer">Company website ↗</a>';
+      }
+    }catch{}
+  }
+}
+function renderModelPerformance(result){
+  const candidates=[...(result.model?.candidates||[])].sort((a,b)=>Number(b.validation_accuracy??0)-Number(a.validation_accuracy??0));
+  const primary=candidates.find(item=>item.key==="primary")||candidates[0];
+  const accuracy=primary?.validation_accuracy;
+  const mae=primary?.mae;
+  const windows=primary?.observations??result.model?.metrics?.backtest?.validation_windows??0;
+  const root=$("model-performance-summary");
+  if(root)root.innerHTML=[
+    ["Primary hybrid accuracy",accuracy==null?"—":(accuracy*100).toFixed(1)+"%"],
+    ["Primary hybrid MAE",mae==null?"—":(mae*100).toFixed(3)+"%"],
+    ["Validation observations",compactNumber(windows)],
+    ["Models evaluated",String(candidates.length)]
+  ].map(([label,value])=>'<div class="performance-kpi"><span>'+escapeHTML(label)+'</span><strong>'+escapeHTML(value)+'</strong></div>').join("");
+  const body=$("model-performance-rows");if(!body)return;
+  body.innerHTML=candidates.map(item=>{
+    const accuracyValue=item.validation_accuracy==null?"—":(100*Number(item.validation_accuracy)).toFixed(1)+"%";
+    const maeValue=item.mae==null?"—":(100*Number(item.mae)).toFixed(3)+"%";
+    return "<tr><td><span class=\"model-name\">"+escapeHTML(item.name||item.key)+"</span></td><td><span class=\"model-layer\">"+escapeHTML(item.type||"Model")+"</span></td><td>"+accuracyValue+"</td><td>"+maeValue+"</td><td>"+compactNumber(item.observations)+"</td><td>"+(Number(item.weight||0).toFixed(2))+"</td></tr>";
+  }).join("")||'<tr><td colspan="6" class="empty">No performance data returned.</td></tr>';
+  setText("model-count",candidates.length+" models");
+  setText("model-version",result.model?.version||"Model version not supplied");
+}
+async function selectStockChartPeriod(id,period){
+  const stock=state.stockChart,config=stockChartConfig(id);if(!stock||!config)return;
+  config.period=period;config.xStart=0;config.xEnd=1;config.yLow=0;config.yHigh=1;config.selectedIndex=null;
+  document.querySelectorAll('[data-chart-id="'+id+'"][data-chart-period]').forEach(button=>button.classList.toggle("active",button.dataset.chartPeriod===period));
+  const special=period==="1D"?"1d":period==="1W"?"1w":period==="MAX"?"max":null;
+  if(special&&!stock.specialRows[period]){
+    const ticker=state.ticker,token=state.loadToken;
+    const inspect=$(id==="history"?"history-inspect":"forecast-inspect");
+    if(inspect)inspect.textContent="Loading "+stockPeriodCaption(period).toLowerCase()+" market history…";
+    try{
+      const data=await api("/api/stock-history?ticker="+encodeURIComponent(ticker)+"&range="+encodeURIComponent(special));
+      if(state.ticker!==ticker||state.stockChart!==stock||state.loadToken!==token)return;
+      stock.specialRows[period]=Array.isArray(data.rows)?data.rows:[];
+      if(!stock.specialRows[period].length)throw new Error("No price data was returned for this range.");
+    }catch(error){
+      if(state.stockChart!==stock)return;
+      stock.specialRows[period]=stock.baseRows;
+      if(inspect)inspect.textContent="Intraday data unavailable. Showing the saved daily history instead.";
+    }
+  }
+  if(state.stockChart!==stock)return;
+  const rows=stockRowsForPeriod(period,stock);
+  if(id==="history")setText("history-chart-caption",stockPeriodCaption(period)+" · "+rows.length+" observations");
+  else setText("chart-caption","Model projections · "+stockPeriodCaption(period)+" historical context");
+  drawStockChart(id);
+  const configMeta=stockChartConfig(id);
+  if(configMeta?.selectedIndex!=null)renderStockInspect(id,configMeta.selectedIndex);
+}
+function bindStockChartCanvas(id){
+  const canvas=$(id==="history"?"history-chart":"stock-chart");if(!canvas||canvas.dataset.stockBound==="1")return;
+  canvas.dataset.stockBound="1";
+  canvas.addEventListener("click",event=>{
+    const config=stockChartConfig(id),meta=config?.meta;if(!config||!meta)return;
+    const rect=canvas.getBoundingClientRect(),localX=event.clientX-rect.left,padLeft=66,padRight=14;
+    const plotWidth=Math.max(1,rect.width-padLeft-padRight),fraction=Math.max(0,Math.min(1,(localX-padLeft)/plotWidth));
+    const index=Math.max(meta.from,Math.min(meta.to,Math.round(meta.from+fraction*(meta.to-meta.from))));
+    config.selectedIndex=index;drawStockChart(id);renderStockInspect(id,index);
+  });
+}
+function installStockChartInteractions(){
+  document.querySelectorAll("[data-stock-jump]").forEach(button=>button.addEventListener("click",()=>{
+    const target=$("stock-"+button.dataset.stockJump+"-section");
+    target?.scrollIntoView({behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth",block:"start"});
+  }));
+  document.querySelectorAll("[data-chart-period]").forEach(button=>button.addEventListener("click",()=>{
+    selectStockChartPeriod(button.dataset.chartId,button.dataset.chartPeriod);
+  }));
+  ["history","forecast"].forEach(bindStockChartCanvas);
+  let drag=null;
+  document.querySelectorAll("[data-chart-axis]").forEach(rail=>rail.addEventListener("pointerdown",event=>{
+    const handle=event.target.closest(".chart-range-handle");if(!handle)return;
+    event.preventDefault();
+    drag={rail,id:rail.dataset.chartId,axis:rail.dataset.chartAxis,edge:handle.dataset.rangeEdge};
+  }));
+  document.addEventListener("pointermove",event=>{
+    if(!drag)return;
+    const rect=drag.rail.getBoundingClientRect(),config=stockChartConfig(drag.id);if(!config)return;
+    if(drag.axis==="x"){
+      const next=Math.max(0,Math.min(1,(event.clientX-rect.left)/Math.max(1,rect.width)));
+      if(drag.edge==="low")config.xStart=Math.min(next,config.xEnd-.04);
+      else config.xEnd=Math.max(next,config.xStart+.04);
+    }else{
+      const next=1-Math.max(0,Math.min(1,(event.clientY-rect.top)/Math.max(1,rect.height)));
+      if(drag.edge==="low")config.yLow=Math.min(next,config.yHigh-.04);
+      else config.yHigh=Math.max(next,config.yLow+.04);
+    }
+    drawStockChart(drag.id);
+  });
+  const stopDrag=()=>{drag=null;};
+  document.addEventListener("pointerup",stopDrag);document.addEventListener("pointercancel",stopDrag);
+}
+function renderAnalysis(result,index){
+  if(!result||typeof result!=="object")throw new Error("The analysis response was empty or invalid.");
+  state.currentAnalysis=result;
+  const hist=result.history&&typeof result.history==="object"?result.history:{};
+  const baseRows=historyRowsFromResult(hist);
+  const forecast=result.forecast&&typeof result.forecast==="object"?result.forecast:{};
+  const lastPrice=Number(baseRows.at(-1)?.close||result.price||0);
+  const series=buildStockModelSeries(result,lastPrice);
+  state.stockChart={
+    token:state.loadToken,baseRows,specialRows:{},series,forecast,
+    charts:{
+      history:{period:"1Y",xStart:0,xEnd:1,yLow:0,yHigh:1,selectedIndex:null,modelVisibility:{}},
+      forecast:{period:"1Y",xStart:0,xEnd:1,yLow:0,yHigh:1,selectedIndex:null,modelVisibility:{}}
+    }
+  };
+  setText("detail-ticker-label",result.ticker||state.ticker);
+  setText("detail-company",result.company||result.ticker||state.ticker);
+  setText("detail-price",money(result.price,result.currency));
+  const change=Number(result.change_percent);
+  const changeText=pct(result.change_percent)+(result.as_of?" · "+result.as_of:"");
+  setText("detail-change",changeText);
+  const changeNode=$("detail-change");
+  if(changeNode)changeNode.className="change "+(Number.isFinite(change)&&change>=0?"up":Number.isFinite(change)?"down":"muted");
+  setText("stock-data-source",(result.data_source||index)+" · "+(result.indexed_at||"fresh result"));
+  setText("forecast-horizon",Number(forecast.horizon||30)+" trading days");
+  const expected=forecast.expected_change_percent;
+  const endLower=forecast.lower_bound?.at(-1),endUpper=forecast.upper_bound?.at(-1);
+  const summary=$("forecast-summary");
+  if(summary)summary.innerHTML="<strong>"+escapeHTML(pct(expected))+"</strong> expected modelled change over "+Number(forecast.horizon||30)+" trading days. Forecast range: "+escapeHTML(money(endLower,result.currency))+" to "+escapeHTML(money(endUpper,result.currency))+". Model outputs are uncertain and should not be treated as guarantees.";
+  renderStockMetrics(result,baseRows);
+  renderCompanyProfile(result);
+  renderModelPerformance(result);
+  renderStockModelKey(series);
+  setText("detail-job-status","Analysis loaded");
+  setText("detail-stage",index+" analysis · "+baseRows.length+" historical observations");
+  const progress=$("detail-progress");if(progress)progress.style.width="100%";
+  selectStockChartPeriod("history","1Y");
+  selectStockChartPeriod("forecast","1Y");
+}
+window.addEventListener("resize",()=>{
+  if(state.currentAnalysis&&state.stockChart){drawStockChart("history");drawStockChart("forecast");}
+  renderMiniCharts();
+});
+installStockChartInteractions();
 async function loadWatchlist(){
   if(!state.user){state.watchlist=[];renderWatchlistSections();return;}
   try{
