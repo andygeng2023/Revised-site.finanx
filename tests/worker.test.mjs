@@ -218,12 +218,15 @@ test("market feed does not persist every quote refresh to D1", async () => {
   assert.match(handler, /cache\.put/);
 });
 
-test("index discovery runs continuously and respects 30000 per index type", async () => {
+test("index discovery runs continuously, respects 30000 caps, and recovers stale queue jobs", async () => {
   const source = await readFile(new URL("../src/worker.js", import.meta.url), "utf8");
   assert.match(source, /MAX_INDEXED=30000/);
   assert.match(source, /indexedTickers\.size>=MAX_INDEXED/);
   assert.match(source, /Scheduled .*continuous discovery refresh/);
   assert.match(source, /cron==="\*\/5 \* \* \* \*"/);
+  assert.match(source, /staleCutoff=new Date\(Date\.now\(\)-10\*60000\)/);
+  assert.match(source, /Recovered stale job; requeued by scheduled scan/);
+  assert.match(source, /sendBatch\(batch\)/);
 });
 
 test("global model learning is stored in KV once per day rather than multiple D1 rows", async () => {
