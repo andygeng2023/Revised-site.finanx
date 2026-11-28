@@ -187,7 +187,7 @@ async function enqueueJob(env,job){
 async function requestAnalysis(req,env){
   const body=await req.json().catch(()=>({})),ticker=String(body.ticker||"").trim().toUpperCase(),indexer=String(body.save_to_indexer||body.indexer||"PreviewIndex").toLowerCase()==="fullindex"?"FullIndex":"PreviewIndex";
   if(!validTicker(ticker))return json({error:"Enter a valid stock ticker."},400);
-  const period=indexer==="FullIndex"?"10y":"5y",horizon=Number(body.horizon??30),maxAge=indexer==="FullIndex"?24:8,hardRescan=body.hard_rescan===true;
+  const period=indexer==="FullIndex"?"10y":"5y",horizon=Number(body.horizon??(indexer==="FullIndex"?60:30)),maxAge=indexer==="FullIndex"?24:8,hardRescan=body.hard_rescan===true;
   if(!Number.isInteger(horizon)||horizon<1||horizon>504)return json({error:"Horizon must be a whole number from 1 to 504 trading days."},400);
   if(!await rateLimit(env,req,"analysis-request",90,3600000))return json({error:"Analysis request limit reached for this connection. Try later."},429);
   const cutoff=new Date(Date.now()-maxAge*3600000).toISOString();
@@ -216,19 +216,18 @@ async function analysisStatus(req,url,env){
   return json({...visible,result:parse(job.result),progress:job.status==="completed"?100:Number(job.progress||0)});
 }
 async function indexAvailability(url,env){
-  const ticker=(url.searchParams.get("ticker")||"").toUpperCase(),horizon=Number(url.searchParams.get("horizon")||30);
+  const ticker=(url.searchParams.get("ticker")||"").toUpperCase();
   if(!validTicker(ticker))return json({error:"Enter a valid ticker."},400);
-  if(!Number.isInteger(horizon)||horizon<1||horizon>504)return json({error:"Horizon must be a whole number from 1 to 504 trading days."},400);
-  const definitions=[{id:"PreviewIndex",period:"5y",age:8},{id:"FullIndex",period:"10y",age:24}],indexes=[];
+  const definitions=[{id:"PreviewIndex",period:"5y",horizon:30,age:8},{id:"FullIndex",period:"10y",horizon:60,age:24}],indexes=[];
   for(const item of definitions){
     const cutoff=new Date(Date.now()-item.age*3600000).toISOString();
-    const row=await first(env,"SELECT indexed_at FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=?",ticker,item.period,horizon,item.id,cutoff);
+    const row=await first(env,"SELECT indexed_at FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=?",ticker,item.period,item.horizon,item.id,cutoff);
     if(row)indexes.push({id:item.id,label:item.id,indexed_at:row.indexed_at});
   }
-  return json({ticker,horizon,indexes,available:indexes.map(x=>x.id),checked_at:isoNow()});
+  return json({ticker,indexes,available:indexes.map(x=>x.id),checked_at:isoNow()});
 }
 async function stockMarketData(url,env){
-  const ticker=(url.searchParams.get("ticker")||"").toUpperCase(),indexer=(url.searchParams.get("indexer")||"PreviewIndex")==="FullIndex"?"FullIndex":"PreviewIndex",horizon=Number(url.searchParams.get("horizon")||30);
+  const ticker=(url.searchParams.get("ticker")||"").toUpperCase(),indexer=(url.searchParams.get("indexer")||"PreviewIndex")==="FullIndex"?"FullIndex":"PreviewIndex",horizon=Number(url.searchParams.get("horizon")||(indexer==="FullIndex"?60:30));
   if(!validTicker(ticker))return json({error:"Enter a valid ticker."},400);
   if(!Number.isInteger(horizon)||horizon<1||horizon>504)return json({error:"Horizon must be a whole number from 1 to 504 trading days."},400);
   const period=indexer==="FullIndex"?"10y":"5y";
@@ -277,7 +276,7 @@ async function marketFeed(url,env,req){
   const placeholders=tickers.map(()=>"?").join(",");
   const [quoteRows,indexRows]=await Promise.all([
     all(env,"SELECT * FROM market_quotes WHERE ticker IN ("+placeholders+")",...tickers),
-    all(env,"SELECT ticker,period,indexer,indexed_at,result FROM market_index WHERE ticker IN ("+placeholders+") AND horizon=30 AND ((indexer='FullIndex' AND indexed_at>=?) OR (indexer='PreviewIndex' AND indexed_at>=?)) ORDER BY indexed_at DESC",...tickers,new Date(Date.now()-24*3600000).toISOString(),new Date(Date.now()-8*3600000).toISOString())
+    all(env,"SELECT ticker,period,indexer,indexed_at,result FROM market_index WHERE ticker IN ("+placeholders+") AND ((indexer='FullIndex' AND horizon=60 AND indexed_at>=?) OR (indexer='PreviewIndex' AND horizon=30 AND indexed_at>=?)) ORDER BY indexed_at DESC",...tickers,new Date(Date.now()-24*3600000).toISOString(),new Date(Date.now()-8*3600000).toISOString())
   ]);
   const quotesByTicker=new Map(quoteRows.map(row=>[row.ticker,row]));
   const catalogByTicker=new Map(catalog.map(row=>[row.ticker,row]));
@@ -326,7 +325,7 @@ async function marketFeed(url,env,req){
       price:quote.price??null,change_percent:quote.change_percent??null,as_of:quote.as_of||null,
       indexer:indexed?.indexer||null,indexed_at:indexed?.indexed_at||null,
       history_preview:history.slice(-45),
-      forecast_preview:analysis?.forecast?.hybrid?.slice(0,30)||[],
+      forecast_preview:analysis?.forecast?.hybrid?.slice(0,indexed?.horizon||30)||[],forecast_horizon:indexed?.horizon||30,
       expected_change_percent:analysis?.forecast?.expected_change_percent??null,
       source:(quote.source||"Yahoo Finance")+(indexed?" + shared index":"")
     };
@@ -350,31 +349,31 @@ async function watchlist(req,env){
   const items=await all(env,"SELECT ticker,created_at FROM watchlist_items WHERE user_id=? ORDER BY created_at DESC",user.id);
   const output=await Promise.all(items.map(async item=>{
     const fullCutoff=new Date(Date.now()-24*3600000).toISOString(),previewCutoff=new Date(Date.now()-8*3600000).toISOString();
-    let row=await first(env,"SELECT result,indexed_at,indexer FROM market_index WHERE ticker=? AND period='10y' AND horizon=30 AND indexer='FullIndex' AND indexed_at>=?",item.ticker,fullCutoff);
-    if(!row)row=await first(env,"SELECT result,indexed_at,indexer FROM market_index WHERE ticker=? AND period='5y' AND horizon=30 AND indexer='PreviewIndex' AND indexed_at>=?",item.ticker,previewCutoff);
+    let row=await first(env,"SELECT result,indexed_at,indexer,horizon FROM market_index WHERE ticker=? AND period='10y' AND horizon=60 AND indexer='FullIndex' AND indexed_at>=?",item.ticker,fullCutoff);
+    if(!row)row=await first(env,"SELECT result,indexed_at,indexer,horizon FROM market_index WHERE ticker=? AND period='5y' AND horizon=30 AND indexer='PreviewIndex' AND indexed_at>=?",item.ticker,previewCutoff);
     const analysis=parse(row?.result);
-    return {...item,indexer:row?.indexer||null,indexed_at:row?.indexed_at||null,analysis:analysis?{company:analysis.company,currency:analysis.currency,price:analysis.price,change_percent:analysis.change_percent,history_preview:analysis.history?.close?.slice(-60)||[],forecast_preview:analysis.forecast?.hybrid||[],expected_change_percent:analysis.forecast?.expected_change_percent}:null};
+    return {...item,indexer:row?.indexer||null,indexed_at:row?.indexed_at||null,analysis:analysis?{company:analysis.company,currency:analysis.currency,price:analysis.price,change_percent:analysis.change_percent,history_preview:analysis.history?.close?.slice(-60)||[],forecast_preview:analysis.forecast?.hybrid||[],forecast_horizon:row.horizon,expected_change_percent:analysis.forecast?.expected_change_percent}:null};
   }));
   return json({items:output});
 }
 async function requestMarketScan(req,env){
   if(!await rateLimit(env,req,"market-scan",30,3600000))return json({error:"Market Scan refresh limit reached. Try again later."},429);
-  // Read fresh 30-day index records only; this endpoint never queues new analyses.
+  // Read PreviewIndex 30-day and FullIndex 60-day records only; never queues new analyses.
   const previewCutoff=new Date(Date.now()-8*3600000).toISOString(),fullCutoff=new Date(Date.now()-24*3600000).toISOString();
-  const rows=await all(env,"SELECT ticker,period,indexer,indexed_at,result FROM market_index WHERE horizon=30 AND ((indexer='PreviewIndex' AND indexed_at>=?) OR (indexer='FullIndex' AND indexed_at>=?)) ORDER BY indexed_at DESC LIMIT 1000",previewCutoff,fullCutoff);
+  const rows=await all(env,"SELECT ticker,period,indexer,horizon,indexed_at,result FROM market_index WHERE ((indexer='PreviewIndex' AND horizon=30 AND indexed_at>=?) OR (indexer='FullIndex' AND horizon=60 AND indexed_at>=?)) ORDER BY indexed_at DESC LIMIT 1000",previewCutoff,fullCutoff);
   const byTicker=new Map();
   for(const row of rows){
     const analysis=parse(row.result), forecast=analysis?.forecast;
     const expected=Number(forecast?.expected_change_percent);
     if(!analysis||!Number.isFinite(expected)||expected<=0)continue;
     const existing=byTicker.get(row.ticker);
-    // Prefer FullIndex when both are available; otherwise keep the newest record.
-    if(!existing || (row.indexer==="FullIndex"&&existing.indexer!=="FullIndex") || (row.indexer===existing.indexer&&row.indexed_at>existing.indexed_at)){
-      byTicker.set(row.ticker,{ticker:row.ticker,company:analysis.company||row.ticker,currency:analysis.currency||"USD",price:analysis.price??null,change_percent:analysis.change_percent??null,indexer:row.indexer,indexed_at:row.indexed_at,history_preview:analysis.history?.close?.slice(-45)||[],forecast_preview:forecast?.hybrid?.slice(0,30)||[],expected_change_percent:expected,risk_score:analysis.risk?.score??null,source:"Indexed 30-day forecast"});
+    // Prefer PreviewIndex 30-day cards; FullIndex 60-day records are fallback only.
+    if(!existing || (row.indexer==="PreviewIndex"&&existing.indexer!=="PreviewIndex") || (row.indexer===existing.indexer&&row.indexed_at>existing.indexed_at)){
+      byTicker.set(row.ticker,{ticker:row.ticker,company:analysis.company||row.ticker,currency:analysis.currency||"USD",price:analysis.price??null,change_percent:analysis.change_percent??null,indexer:row.indexer,indexed_at:row.indexed_at,history_preview:analysis.history?.close?.slice(-45)||[],forecast_preview:forecast?.hybrid?.slice(0,row.horizon)||[],forecast_horizon:row.horizon,expected_change_percent:expected,risk_score:analysis.risk?.score??null,source:"Indexed "+row.horizon+"-day forecast"});
     }
   }
   const ranked=[...byTicker.values()].sort((a,b)=>b.expected_change_percent-a.expected_change_percent);
-  return json({scan_type:"positive_indexed_30_day_rank",queued:0,total_indexed:rows.length,scanned:ranked.length,items:ranked,generated_at:isoNow(),message:"Only positive 30-day forecasts are shown, ranked highest to lowest. No new analysis jobs were queued."});
+  return json({scan_type:"positive_indexed_preview30_full60_rank",queued:0,total_indexed:rows.length,scanned:ranked.length,items:ranked,generated_at:isoNow(),message:"Positive indexed forecasts: PreviewIndex 30-day and FullIndex 60-day, ranked highest to lowest. No new analysis jobs were queued."});
 }
 async function listJobs(req,env){
   const user=await authUser(req,env);
@@ -403,17 +402,17 @@ async function processJob(id,env){
   }
 }
 async function refreshIndexes(env,indexer){
-  const period=indexer==="FullIndex"?"10y":"5y",cutoff=new Date(Date.now()-6*3600000).toISOString();
+  const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cutoff=new Date(Date.now()-6*3600000).toISOString();
   const catalog=(await all(env,"SELECT ticker FROM ticker_catalog ORDER BY COALESCE(last_indexed_at,'') ASC LIMIT 100")).map(x=>x.ticker);
   const candidates=catalog.length?catalog:POPULAR;
   const batch=[];
   for(const ticker of candidates){
-    const recent=await first(env,"SELECT indexed_at FROM market_index WHERE ticker=? AND period=? AND horizon=30 AND indexer=? AND indexed_at>=? LIMIT 1",ticker,period,indexer,cutoff);
+    const recent=await first(env,"SELECT indexed_at FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=? LIMIT 1",ticker,period,horizon,indexer,cutoff);
     if(recent)continue;
     const active=await first(env,"SELECT id FROM analysis_jobs WHERE ticker=? AND save_to_indexer=? AND status IN ('queued','running') LIMIT 1",ticker,indexer);
     if(active)continue;
     const id=crypto.randomUUID(),created=isoNow();
-    await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,save_to_indexer,status,created_at,updated_at,stage,progress) VALUES(?,?,?,30,?,'queued',?,?,?,0)",id,ticker,period,indexer,created,created,"Scheduled "+indexer+" refresh");
+    await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,save_to_indexer,status,created_at,updated_at,stage,progress) VALUES(?,?,?,?,?,'queued',?,?,?,0)",id,ticker,period,horizon,indexer,created,created,"Scheduled "+indexer+" refresh");
     batch.push({body:{jobId:id}});
     if(batch.length>=24)break;
   }
