@@ -56,7 +56,7 @@ test("serves the Finanx application and core pages", async () => {
   assert.match(html, /\.cards:not\(\.scan-rail\)\{display:grid!important/);
   assert.match(html, /\.scan-rail\{display:flex!important/);
   assert.doesNotMatch(html, /setTimeout\(\(\)=>showAuth/);
-  assert.match(html, /const API="https:\/\/revised-finanx\.stock-analyser-2026\.workers\.dev";
+  assert.match(html, /const API="https:\/\/revised-finanx\.stock-analyser-2026\.workers\.dev";/);
 });
 
 test("embedded browser JavaScript parses and has no duplicate HTML IDs", async () => {
