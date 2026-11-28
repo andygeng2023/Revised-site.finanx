@@ -338,3 +338,17 @@ test("KV-backed accounts can add, list and remove watchlist items without D1 wri
   const finalList = await worker.fetch(new Request("https://finanx.test/api/watchlist", { method: "POST", headers, body: JSON.stringify({ action: "list" }) }), env, { waitUntil() {} });
   assert.deepEqual((await finalList.json()).items, []);
 });
+
+
+test("signup refuses an existing D1 email before attempting KV fallback", async () => {
+  const env = testEnv({
+    failUserInsert: true,
+    firstResult: sql => sql.includes("SELECT id FROM users WHERE email") ? { id: "existing-user-id" } : null
+  });
+  const response = await worker.fetch(new Request("https://finanx.test/api/auth/signup", {
+    method: "POST", headers: { "Content-Type": "application/json", "cf-connecting-ip": "192.0.2.224" },
+    body: JSON.stringify({ email: "existing@example.com", password: "secure-test-password" })
+  }), env, { waitUntil() {} });
+  assert.equal(response.status, 409);
+  assert.equal(env.calls.sql.some(call => call.sql.includes("INSERT INTO users")), false);
+});
