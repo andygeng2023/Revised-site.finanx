@@ -14,9 +14,18 @@
   ],
   "queues": {
     "producers": [
-      { "binding": "ANALYSIS_QUEUE", "queue": "revised-finanx-analysis" }
+      { "binding": "ANALYSIS_QUEUE", "queue": "revised-finanx-analysis" },
+      { "binding": "FULLINDEX_QUEUE", "queue": "revised-finanx-fullindex" }
     ],
     "consumers": [
+      {
+        "queue": "revised-finanx-fullindex",
+        "max_batch_size": 5,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "retry_delay": 30,
+        "dead_letter_queue": "revised-finanx-analysis-dlq"
+      },
       {
         "queue": "revised-finanx-analysis",
         "max_batch_size": 5,
