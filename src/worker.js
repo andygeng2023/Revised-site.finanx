@@ -230,8 +230,9 @@ async function marketFeed(url,env){
     try{const r=await fetch(searchUrl,{headers:{"User-Agent":"Mozilla/5.0"},signal:AbortSignal.timeout(9000)});if(!r.ok)throw new Error("Search unavailable");const d=await r.json();return json({suggestions:(d.quotes||[]).filter(x=>x.symbol).map(x=>({symbol:x.symbol,name:x.longname||x.shortname||x.symbol,exchange:x.exchange||""}))});}catch{return json({suggestions:[]});}
   }
   const catalog=await all(env,"SELECT ticker,company,currency FROM ticker_catalog ORDER BY ticker LIMIT 60");
-  const tickers=catalog.length?catalog.map(x=>x.ticker):POPULAR;
-  const items=await Promise.all(tickers.slice(0,36).map(async ticker=>{
+  const indexed=await all(env,"SELECT DISTINCT ticker FROM market_index ORDER BY ticker LIMIT 100");
+  const tickers=POPULAR.concat(catalog.map(x=>x.ticker),indexed.map(x=>x.ticker)).filter((x,i,a)=>a.indexOf(x)===i).slice(0,48);
+  const items=await Promise.all(tickers.slice(0,48).map(async ticker=>{
     try{
       const cachedQuote=await first(env,"SELECT * FROM market_quotes WHERE ticker=? AND updated_at>=?",ticker,new Date(Date.now()-5*60000).toISOString());
       const quote=cachedQuote?{ticker,company:cachedQuote.company,currency:cachedQuote.currency,price:cachedQuote.price,change_percent:cachedQuote.change_percent,as_of:cachedQuote.as_of,history:[],source:cachedQuote.source}:await yahooChart(ticker,"1y");
