@@ -258,7 +258,7 @@ async function fetchYahooNews(query,limit=12){
   const now=Date.now(),items=(data.news||[]).map(item=>{
     const ts=Number(item.providerPublishTime||item.pubDate||item.publishedAt||0);
     const published=ts>1e12?ts:ts*1000;
-    return {title:String(item.title||""),summary:String(item.summary||item.description||""),publisher:String(item.publisher||item.provider||"News source"),url:String(item.link||item.url||""),published_at:published?new Date(published).toISOString():null,age_hours:published?Math.max(0,(now-published)/3600000):null};
+    const resolutions=item.thumbnail?.resolutions||[];const image=resolutions.slice().sort((a,b)=>Number(b.width||0)-Number(a.width||0))[0]?.url||item.thumbnail?.url||item.image?.url||item.image||item.images?.[0]?.url||"";return {title:String(item.title||""),summary:String(item.summary||item.description||""),publisher:String(item.publisher||item.provider||"News source"),url:String(item.link||item.url||""),image:String(image||""),published_at:published?new Date(published).toISOString():null,age_hours:published?Math.max(0,(now-published)/3600000):null};
   }).filter(item=>item.title&&item.url);
   return items;
 }
