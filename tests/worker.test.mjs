@@ -224,9 +224,20 @@ test("index discovery runs continuously, respects 30000 caps, and recovers stale
   assert.match(source, /indexedTickers\.size>=MAX_INDEXED/);
   assert.match(source, /Scheduled .*continuous discovery refresh/);
   assert.match(source, /cron==="\*\/5 \* \* \* \*"/);
-  assert.match(source, /staleCutoff=new Date\(Date\.now\(\)-10\*60000\)/);
+  assert.match(source, /staleCutoff=new Date\(Date\.now\(\)-2\*3600000\)/);
   assert.match(source, /Recovered stale job; requeued by scheduled scan/);
   assert.match(source, /sendBatch\(batch\)/);
+  assert.match(source, /job_type='scan'/);
+  assert.match(source, /LIMIT 100/);
+  assert.match(source, /D1_WRITE_PAUSE_KEY/);
+  assert.match(source, /queue completions immediately continue the scan pipeline/);
+  const status = source.slice(source.indexOf("async function queueStatus"), source.indexOf("async function searchRoute"));
+  assert.match(status, /stage LIKE 'Scheduled % discovery refresh'/);
+  const consumer = source.slice(source.indexOf("  async queue(batch,env){"), source.indexOf("  async scheduled(controller,env,ctx){"));
+  assert.match(consumer, /completed\?\.jobType==="scan"/);
+  assert.match(consumer, /refreshIndexes\(env,indexer\)/);
+  assert.match(consumer, /Not enough valid historical prices were returned/);
+  assert.match(consumer, /isD1DailyWriteLimitError/);
 });
 
 test("global model learning is stored in KV once per day rather than multiple D1 rows", async () => {
@@ -326,8 +337,8 @@ test("scheduled index refreshes run every five minutes for both index types", as
   worker.scheduled({ cron: "*/5 * * * *" }, env, { waitUntil: promise => promises.push(promise) });
   assert.equal(promises.length, 2, "Both index types should be refreshed on every scan cycle");
   await Promise.all(promises);
-  assert.ok(env.calls.sql.some(x => x.sql.includes("INSERT INTO analysis_jobs") && x.args[4] === "PreviewIndex"));
-  assert.ok(env.calls.sql.some(x => x.sql.includes("INSERT INTO analysis_jobs") && x.args[4] === "FullIndex"));
+  assert.ok(env.calls.sql.some(x => x.sql.includes("INSERT INTO analysis_jobs") && x.args[5] === "PreviewIndex"));
+  assert.ok(env.calls.sql.some(x => x.sql.includes("INSERT INTO analysis_jobs") && x.args[5] === "FullIndex"));
   assert.ok(env.calls.batchMessages.length >= 2);
 });
 
