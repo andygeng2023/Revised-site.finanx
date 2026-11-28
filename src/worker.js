@@ -15,6 +15,30 @@ const localRateLimits = new Map();
 const localMarketQuotes = new Map();
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, Number.isFinite(n) ? n : 0));
 const isoNow = () => new Date().toISOString();
+const D1_WRITE_PAUSE_KEY = "finanx:d1-daily-write-pause";
+function isD1DailyWriteLimitError(error){
+  return /D1.*free tier daily row write limit|daily row write limit/i.test(String(error?.message||error||""));
+}
+async function getD1WritePause(env){
+  if(!env.AUTH_KV)return null;
+  try{
+    const pause=await env.AUTH_KV.get(D1_WRITE_PAUSE_KEY,"json");
+    return pause?.until&&Date.parse(pause.until)>Date.now()?pause:null;
+  }catch(error){
+    console.warn("Finanx D1 pause marker lookup failed.",String(error?.message||error));
+    return null;
+  }
+}
+async function pauseForD1WriteLimit(env,error){
+  if(!env.AUTH_KV)return false;
+  const now=new Date(),reset=Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()+1);
+  const ttl=Math.max(60,Math.ceil((reset-Date.now())/1000)+30);
+  await env.AUTH_KV.put(D1_WRITE_PAUSE_KEY,JSON.stringify({
+    until:new Date(reset).toISOString(),
+    reason:String(error?.message||error||"D1 daily row-write quota exhausted").slice(0,300)
+  }),{expirationTtl:ttl});
+  return true;
+}
 const json = (body,status=200,extra={}) => new Response(JSON.stringify(body),{status,headers:{...CORS,"Cache-Control":"no-store",...extra}});
 const parse = value => { try { return typeof value==="string" ? JSON.parse(value) : value; } catch { return null; } };
 const validTicker = value => /^[A-Z0-9.^=-]{1,20}$/.test(String(value||""));
@@ -600,12 +624,12 @@ async function listJobs(req,env){
 }
 async function processJob(id,env){
   const job=await first(env,"SELECT * FROM analysis_jobs WHERE id=?",id);
-  if(!job||job.status==="completed")return;
+  if(!job||job.status==="completed")return null;
   const indexer=job.save_to_indexer==="FullIndex"?"FullIndex":"PreviewIndex",period=indexer==="FullIndex"?"10y":job.period||"5y",cooldownCutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString();
   const recent=await first(env,"SELECT result,indexed_at,source_job_id FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=? LIMIT 1",job.ticker,period,job.horizon,indexer,cooldownCutoff);
   if(recent?.result&&job.job_type!=="hard_rescan"){
     await run(env,"UPDATE analysis_jobs SET status='completed',result=?,error=NULL,progress=100,stage='Eight-hour cache active; reused existing index',updated_at=? WHERE id=?",recent.result,isoNow(),id);
-    return;
+    return {indexer,jobType:job.job_type};
   }
   try{
     await run(env,"UPDATE analysis_jobs SET status='running',attempts=attempts+1,progress=3,stage='Starting analysis worker',updated_at=? WHERE id=?",isoNow(),id);
@@ -613,6 +637,7 @@ async function processJob(id,env){
     await run(env,"INSERT INTO market_index(ticker,period,horizon,indexer,indexed_at,source_job_id,result) VALUES(?,?,?,?,?,?,?) ON CONFLICT(ticker,period,horizon,indexer) DO UPDATE SET indexed_at=excluded.indexed_at,source_job_id=excluded.source_job_id,result=excluded.result",job.ticker,period,job.horizon,indexer,isoNow(),id,stored);
     await run(env,"INSERT OR IGNORE INTO ticker_catalog(ticker,company,currency,last_indexed_at,created_at) VALUES(?,?,?,?,?)",job.ticker,result.company,result.currency,isoNow(),isoNow());
     await run(env,"UPDATE analysis_jobs SET status='completed',result=?,error=NULL,progress=100,stage='Analysis complete',updated_at=? WHERE id=?",stored,isoNow(),id);
+    return {indexer,jobType:job.job_type};
   }catch(error){
     const message=String(error?.message||error||"Analysis failed").slice(0,800);
     await run(env,"UPDATE analysis_jobs SET status='failed',error=?,progress=0,stage='Analysis failed',updated_at=? WHERE id=?",message,isoNow(),id);
@@ -638,15 +663,26 @@ async function discoverIndexTickers(){
   return [...new Set(found)];
 }
 async function refreshIndexes(env,indexer){
+  if(await getD1WritePause(env))return;
+  try{return await refreshIndexesCore(env,indexer);}
+  catch(error){
+    if(isD1DailyWriteLimitError(error))await pauseForD1WriteLimit(env,error).catch(pauseError=>console.error("Finanx could not persist the D1 quota pause.",pauseError));
+    throw error;
+  }
+}
+async function refreshIndexesCore(env,indexer){
   const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString(),staleCutoff=new Date(Date.now()-10*60000).toISOString(),MAX_INDEXED=30000;
+  // Older discovery jobs omitted job_type='scan', which made queue metrics hide them.
+  await run(env,"UPDATE analysis_jobs SET job_type='scan' WHERE job_type='analysis' AND user_id IS NULL AND stage LIKE 'Scheduled % discovery refresh'");
+
   // Recover jobs whose D1 status outlived their queue message (e.g. messages expired or a consumer crashed).
-  const stale=await all(env,"SELECT id,ticker FROM analysis_jobs WHERE save_to_indexer=? AND status IN ('queued','running') AND updated_at<? ORDER BY updated_at ASC LIMIT 4",indexer,staleCutoff);
+  const stale=await all(env,"SELECT id,ticker FROM analysis_jobs WHERE save_to_indexer=? AND status IN ('queued','running') AND updated_at<? ORDER BY updated_at ASC LIMIT 100",indexer,staleCutoff);
   if(stale.length){
     const queue=indexer==="FullIndex"?env.FULLINDEX_QUEUE:env.PREVIEWINDEX_QUEUE;
     if(!queue?.sendBatch)throw new Error(indexer+" queue binding is unavailable during recovery");
     const batch=stale.map(job=>({body:{jobId:job.id}}));
     await queue.sendBatch(batch);
-    await Promise.all(stale.map(job=>run(env,"UPDATE analysis_jobs SET status='queued',progress=0,stage='Recovered stale job; requeued by scheduled scan',updated_at=? WHERE id=?",isoNow(),job.id)));
+    await Promise.all(stale.map(job=>run(env,"UPDATE analysis_jobs SET status='queued',progress=0,attempts=0,error=NULL,stage='Recovered stale job; requeued by scheduled scan',updated_at=? WHERE id=?",isoNow(),job.id)));
   }
   const discovered=await discoverIndexTickers();
   const catalog=(await all(env,"SELECT ticker FROM ticker_catalog ORDER BY COALESCE(last_indexed_at,'') ASC LIMIT 500")).map(x=>x.ticker);
@@ -662,7 +698,7 @@ async function refreshIndexes(env,indexer){
     // Existing expired entries can refresh; only new distinct tickers count against the 30,000 cap.
     if(!indexedTickers.has(ticker)&&indexedTickers.size>=MAX_INDEXED)continue;
     const id=crypto.randomUUID(),created=isoNow();
-    await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,save_to_indexer,status,created_at,updated_at,stage,progress) VALUES(?,?,?,?,?,'queued',?,?,?,0)",id,ticker,period,horizon,indexer,created,created,"Scheduled "+indexer+" continuous discovery refresh");
+    await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,job_type,save_to_indexer,status,created_at,updated_at,stage,progress) VALUES(?,?,?,?,?,?,'queued',?,?,?,0)",id,ticker,period,horizon,"scan",indexer,created,created,"Scheduled "+indexer+" continuous discovery refresh");
     activeTickers.add(ticker);indexedTickers.add(ticker);batch.push({body:{jobId:id}});
     if(batch.length>=4)break;
   }
@@ -726,25 +762,82 @@ export default {
     return new Response(PAGE,{headers:{"Content-Type":"text/html; charset=utf-8","Cache-Control":"no-store","X-Content-Type-Options":"nosniff","Referrer-Policy":"strict-origin-when-cross-origin","X-Frame-Options":"DENY","Permissions-Policy":"camera=(), microphone=(), geolocation=()","Content-Security-Policy":"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' https://revised-finanx.stock-analyser-2026.workers.dev; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"}});
   },
   async queue(batch,env){
+    const continueIndexers=new Set();
+    let paused=!!(await getD1WritePause(env));
     for(const message of batch.messages){
-      try{const id=message.body?.jobId;if(!id)throw new Error("Queue message has no jobId");await processJob(id,env);message.ack();}
-      catch(error){
+      if(paused){message.ack();continue;}
+      const id=message.body?.jobId;
+      try{
+        if(!id)throw new Error("Queue message has no jobId");
+        const completed=await processJob(id,env);
+        message.ack();
+        if(completed?.jobType==="scan")continueIndexers.add(completed.indexer);
+      }catch(error){
+        const messageText=String(error?.message||error||"Analysis failed").slice(0,800);
         console.error("Queue job failed",error);
-        const id=message.body?.jobId,attempts=Number(message.attempts||1);
+        if(isD1DailyWriteLimitError(error)){
+          await pauseForD1WriteLimit(env,error).catch(pauseError=>console.error("Finanx could not persist the D1 quota pause.",pauseError));
+          paused=true;
+          message.ack();
+          continue;
+        }
+        // Insufficient market history is a permanent data-quality failure, not a transient queue error.
+        if(/Not enough valid historical prices were returned/i.test(messageText)){
+          if(id){
+            try{await run(env,"UPDATE analysis_jobs SET status='failed',progress=0,stage='Insufficient historical market data',error=?,updated_at=? WHERE id=?",messageText,isoNow(),id);}
+            catch(persistError){
+              console.error("Could not persist permanent analysis failure",persistError);
+              if(isD1DailyWriteLimitError(persistError)){
+                await pauseForD1WriteLimit(env,persistError).catch(pauseError=>console.error("Finanx could not persist the D1 quota pause.",pauseError));
+                paused=true;
+              }
+            }
+          }
+          message.ack();
+          continue;
+        }
+        const attempts=Number(message.attempts||1);
         if(id&&attempts<5){
-          await run(env,"UPDATE analysis_jobs SET status='queued',progress=0,stage='Retrying after a temporary worker error',error=?,updated_at=? WHERE id=?",String(error?.message||error).slice(0,800),isoNow(),id);
+          try{
+            await run(env,"UPDATE analysis_jobs SET status='queued',progress=0,stage='Retrying after a temporary worker error',error=?,updated_at=? WHERE id=?",messageText,isoNow(),id);
+          }catch(persistError){
+            console.error("Could not persist queue retry status",persistError);
+            if(isD1DailyWriteLimitError(persistError)){
+              await pauseForD1WriteLimit(env,persistError).catch(pauseError=>console.error("Finanx could not persist the D1 quota pause.",pauseError));
+              paused=true;
+            }
+          }
+          if(paused){message.ack();continue;}
           message.retry({delaySeconds:Math.min(300,20*Math.max(1,attempts))});
         }else{
-          if(id)await run(env,"UPDATE analysis_jobs SET status='failed',progress=0,stage='Retry limit reached',error=?,updated_at=? WHERE id=?",String(error?.message||error).slice(0,800),isoNow(),id);
+          if(id){
+            try{await run(env,"UPDATE analysis_jobs SET status='failed',progress=0,stage='Retry limit reached',error=?,updated_at=? WHERE id=?",messageText,isoNow(),id);}
+            catch(persistError){
+              console.error("Could not persist retry-limit failure",persistError);
+              if(isD1DailyWriteLimitError(persistError)){
+                await pauseForD1WriteLimit(env,persistError).catch(pauseError=>console.error("Finanx could not persist the D1 quota pause.",pauseError));
+                paused=true;
+              }
+            }
+          }
           message.ack();
         }
       }
+    }
+    if(!paused&&!(await getD1WritePause(env))){
+      await Promise.all([...continueIndexers].map(indexer=>
+        refreshIndexes(env,indexer).catch(error=>console.error(indexer+" event-driven index continuation failed",error))
+      ));
     }
   },
   async scheduled(controller,env,ctx){
     const cron=controller.cron||"";
     if(cron==="*/5 * * * *"){
-      // Continuously discover and queue eligible stocks; each index type has its own 30,000 cap.
+      if(await getD1WritePause(env)){
+        console.warn("Finanx indexing paused until the D1 daily row-write limit resets at midnight UTC.");
+        return;
+      }
+      // The cron is a recovery watchdog; queue completions immediately continue the scan pipeline.
       ctx.waitUntil(refreshIndexes(env,"PreviewIndex").catch(error=>console.error("PreviewIndex scheduled refresh failed",error)));
       ctx.waitUntil(refreshIndexes(env,"FullIndex").catch(error=>console.error("FullIndex scheduled refresh failed",error)));
       const scheduledAt=new Date(Number(controller.scheduledTime||Date.now()));
