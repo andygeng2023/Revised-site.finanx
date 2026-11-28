@@ -46,10 +46,11 @@ test("serves the Finanx application and core pages", async () => {
   assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
   const html = await response.text();
   for (const marker of [
-    "Market intelligence", "Market Activity", "Market Scan", "PreviewIndex",
-    "FullIndex", "stock-chart", "history-chart", "market-activity",
-    "password-form", "Analysis queue", "Watchlist"
+    "Market intelligence", "Stocks to explore", "Market Scan", "PreviewIndex",
+    "FullIndex", "stock-chart", "history-chart", "home-featured-cards",
+    "discover-featured-cards", "Analysis history", "Watchlist", "settings-grid"
   ]) assert.ok(html.includes(marker), `Missing page marker: ${marker}`);
+  assert.doesNotMatch(html, /Market Activity|market-activity/);
   assert.match(html, /\.cards:not\(\.scan-rail\)\{display:grid!important/);
   assert.match(html, /\.scan-rail\{display:flex!important/);
   assert.doesNotMatch(html, /setTimeout\(\(\)=>showAuth/);
