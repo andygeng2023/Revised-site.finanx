@@ -52,7 +52,7 @@ async function authRoute(req,env,url){
     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Enter a valid email and a password of at least 8 characters."},400);
     const salt=hex(crypto.getRandomValues(new Uint8Array(16))),hash=await passwordHash(password,salt),id=crypto.randomUUID(),created=isoNow();
     try{await run(env,"INSERT INTO users(id,email,password_hash,password_salt,created_at,last_sign_in_at) VALUES(?,?,?,?,?,?)",id,email,hash,salt,created,created);}
-    catch{return json({error:"An account with that email already exists."},409);}
+    catch(error){const message=String(error?.message||error);if(/unique constraint|constraint failed.*users\.email|users\.email.*unique/i.test(message))return json({error:"An account with that email already exists."},409);throw error;}
     const session=await createSession(env,id),user={id,email,display_name:"",created_at:created,last_sign_in_at:created};
     return json({user,session:{...session,user}},201);
   }
