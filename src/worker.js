@@ -266,9 +266,11 @@ async function marketFeed(url,env,req){
   if(!await rateLimit(env,req,"market-feed",15,60000))return json({error:"Market feed refresh limit reached. Try again shortly."},429);
 
   // Keep the universe bounded so even a provider fallback stays within Worker subrequest limits.
-  const catalog=await all(env,"SELECT ticker,company,currency FROM ticker_catalog ORDER BY ticker LIMIT 60");
-  const indexedTickers=await all(env,"SELECT DISTINCT ticker FROM market_index ORDER BY ticker LIMIT 100");
-  const tickers=POPULAR.concat(catalog.map(x=>x.ticker),indexedTickers.map(x=>x.ticker))
+  const [catalog,indexedTickers]=await Promise.all([
+    all(env,"SELECT ticker,company,currency FROM ticker_catalog ORDER BY COALESCE(last_indexed_at,'') DESC LIMIT 60"),
+    all(env,"SELECT ticker,MAX(indexed_at) AS latest FROM market_index GROUP BY ticker ORDER BY latest DESC LIMIT 100")
+  ]);
+  const tickers=POPULAR.slice(0,8).concat(indexedTickers.map(x=>x.ticker),catalog.map(x=>x.ticker),POPULAR.slice(8))
     .filter((ticker,index,items)=>validTicker(ticker)&&items.indexOf(ticker)===index).slice(0,24);
   if(!tickers.length)return json({items:[],generated_at:isoNow(),index_counts:{PreviewIndex:0,FullIndex:0}});
 
