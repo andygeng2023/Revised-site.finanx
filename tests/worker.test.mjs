@@ -3,28 +3,74 @@ import assert from "node:assert/strict";
 import worker from "../src/worker.js";
 import { getOriginalPredictions, ensemblePredictions, buildModelEvaluation, modelCandidates } from "../src/models.js";
 
-test("serves the Finanx single-page application", async () => {
+function testEnv({ firstResult = null, failDatabase = false } = {}) {
+  const calls = { sql: [], queue: 0, batches: 0 };
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            calls.sql.push({ sql, args });
+            return {
+              first: async () => {
+                if (failDatabase) throw new Error("D1 unavailable");
+                if (sql.includes("INSERT INTO api_rate_limits")) return { attempts: 1 };
+                if (sql.includes("SELECT 1 AS ok")) return { ok: 1 };
+                if (typeof firstResult === "function") return firstResult(sql, args);
+                return firstResult;
+              },
+              all: async () => ({ results: [] }),
+              run: async () => ({ success: true, meta: { changes: 1 } })
+            };
+          }
+        };
+      },
+      batch: async () => { calls.batches++; return []; }
+    },
+    ANALYSIS_QUEUE: { send: async () => { calls.queue++; } },
+    calls
+  };
+  return env;
+}
+
+test("serves the Finanx application and core pages", async () => {
   const response = await worker.fetch(new Request("https://finanx.test/"), {}, { waitUntil() {} });
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type"), /text\/html/);
+  assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+  assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
   const html = await response.text();
-  assert.match(html, /Market intelligence/);
-  assert.match(html, /PreviewIndex/);
-  assert.match(html, /FullIndex/);
-  assert.match(html, /Run market scan/);
-  assert.match(html, /stock-chart/);
+  for (const marker of [
+    "Market intelligence", "Market Activity", "Market Scan", "PreviewIndex",
+    "FullIndex", "stock-chart", "history-chart", "market-activity",
+    "password-form", "Analysis queue", "Watchlist"
+  ]) assert.ok(html.includes(marker), `Missing page marker: ${marker}`);
+  assert.match(html, /\.cards:not\(\.scan-rail\)\{display:grid!important/);
+  assert.match(html, /\.scan-rail\{display:flex!important/);
+  assert.doesNotMatch(html, /setTimeout\(\(\)=>showAuth/);
 });
 
-test("provides a health endpoint", async () => {
-  const response = await worker.fetch(new Request("https://finanx.test/api/health"), {}, { waitUntil() {} });
+test("health endpoint verifies database and queue bindings", async () => {
+  const env = testEnv();
+  const response = await worker.fetch(new Request("https://finanx.test/api/health"), env, { waitUntil() {} });
   const body = await response.json();
   assert.equal(response.status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.database, "D1");
   assert.equal(body.queue, "Cloudflare Queues");
+  assert.ok(env.calls.sql.some(x => x.sql.includes("SELECT 1 AS ok")));
 });
 
-test("handles browser preflight requests", async () => {
+test("health endpoint reports a failed database check", async () => {
+  const env = testEnv({ failDatabase: true });
+  const response = await worker.fetch(new Request("https://finanx.test/api/health"), env, { waitUntil() {} });
+  const body = await response.json();
+  assert.equal(response.status, 503);
+  assert.equal(body.ok, false);
+  assert.equal(body.database, "Unavailable");
+});
+
+test("handles browser preflight requests without database access", async () => {
   const response = await worker.fetch(new Request("https://finanx.test/api/health", { method: "OPTIONS" }), {}, { waitUntil() {} });
   assert.equal(response.status, 204);
 });
@@ -32,6 +78,37 @@ test("handles browser preflight requests", async () => {
 test("unknown API routes return 404", async () => {
   const response = await worker.fetch(new Request("https://finanx.test/api/not-a-route"), {}, { waitUntil() {} });
   assert.equal(response.status, 404);
+});
+
+test("rejects unsupported forecast horizons before querying D1", async () => {
+  const env = testEnv();
+  const response = await worker.fetch(new Request("https://finanx.test/api/index-availability?ticker=AAPL&horizon=0"), env, { waitUntil() {} });
+  const body = await response.json();
+  assert.equal(response.status, 400);
+  assert.match(body.error, /whole number/);
+  assert.equal(env.calls.sql.length, 0);
+});
+
+test("does not expose a user-owned analysis job to anonymous callers", async () => {
+  const env = testEnv({
+    firstResult: sql => sql.includes("FROM analysis_jobs")
+      ? { id: "123e4567-e89b-12d3-a456-426614174000", ticker: "AAPL", status: "completed", result: "{}", user_id: "user-private" }
+      : null
+  });
+  const response = await worker.fetch(new Request("https://finanx.test/api/analysis-status?id=123e4567-e89b-12d3-a456-426614174000"), env, { waitUntil() {} });
+  assert.equal(response.status, 404);
+  assert.equal(env.calls.sql.length, 1);
+});
+
+test("market scan reads existing fresh indexes without enqueuing new work", async () => {
+  const env = testEnv();
+  const response = await worker.fetch(new Request("https://finanx.test/api/market-scan", { method: "POST", headers: { "Content-Type": "application/json", "cf-connecting-ip": "192.0.2.10" }, body: "{}" }), env, { waitUntil() {} });
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.queued, 0);
+  assert.deepEqual(body.items, []);
+  assert.equal(env.calls.queue, 0);
+  assert.ok(env.calls.sql.some(x => x.sql.includes("INSERT INTO api_rate_limits")));
 });
 
 test("FullIndex uses 15 original models, 10 hybrids, 3 meta-hybrids and one primary", () => {
