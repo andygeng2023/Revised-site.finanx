@@ -53,7 +53,7 @@ test("serves the Finanx application and core pages", async () => {
     "Background processing", "Validation & limitations"
   ]) assert.ok(html.includes(marker), `Missing page marker: ${marker}`);
   assert.doesNotMatch(html, /Market Activity|market-activity/);
-  assert.match(html, /\.cards\{display:flex;flex-wrap:nowrap;overflow-x:auto/);
+  assert.match(html, /\.cards\{display:flex;flex-flow:row nowrap;width:100%/);
   assert.doesNotMatch(html, /\.cards:not\(\.scan-rail\)|\.scan-rail\{display:flex!important|Final horizontal-card rails/);
   assert.doesNotMatch(html, /setTimeout\(\(\)=>showAuth/);
   assert.match(html, /const API="https:\/\/revised-finanx\.stock-analyser-2026\.workers\.dev";/);
