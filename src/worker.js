@@ -223,6 +223,12 @@ async function stockMarketData(url,env){
   if(!row)return json({analysis:null,indexer,available:false},404);
   return json({analysis:parse(row.result),indexer,indexed_at:row.indexed_at,available:true});
 }
+async function indexedStats(env){
+  const preview=await first(env,"SELECT COUNT(DISTINCT ticker) AS tickers,COUNT(*) AS records,MAX(indexed_at) AS latest FROM market_index WHERE indexer='PreviewIndex'");
+  const full=await first(env,"SELECT COUNT(DISTINCT ticker) AS tickers,COUNT(*) AS records,MAX(indexed_at) AS latest FROM market_index WHERE indexer='FullIndex'");
+  const tracked=await first(env,"SELECT COUNT(DISTINCT ticker) AS tickers FROM ticker_catalog");
+  return json({tracked:Number(tracked?.tickers||0),preview:{tickers:Number(preview?.tickers||0),records:Number(preview?.records||0),latest:preview?.latest||null},full:{tickers:Number(full?.tickers||0),records:Number(full?.records||0),latest:full?.latest||null},generated_at:isoNow()});
+}
 async function marketFeed(url,env){
   const q=(url.searchParams.get("q")||"").trim().slice(0,60);
   if(q){
@@ -359,6 +365,7 @@ async function handleApi(req,env,url){
   if(path==="/api/health")return json({ok:true,service:"revised-finanx",database:"D1",queue:"Cloudflare Queues",time:isoNow()});
   if(path.startsWith("/api/auth/"))return authRoute(req,env,url);
   if(path==="/api/market-feed"&&req.method==="GET")return marketFeed(url,env);
+  if(path==="/api/indexed-stats"&&req.method==="GET")return indexedStats(env);
   if(path==="/api/search"&&req.method==="GET")return searchRoute(url,env);
   if(path==="/api/model-learning"&&req.method==="GET")return modelLearning(url,env);
   if(path==="/api/queue-status"&&req.method==="GET")return queueStatus(req,env);
