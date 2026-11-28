@@ -33,6 +33,7 @@ function testEnv({ firstResult = null, failDatabase = false } = {}) {
       batch: async () => { calls.batches++; return []; }
     },
     ANALYSIS_QUEUE: { send: async () => { calls.queue++; }, sendBatch: async messages => { calls.batchMessages.push(...messages); } },
+    FULLINDEX_QUEUE: { sendBatch: async messages => { calls.batchMessages.push(...messages); } },
     calls
   };
   return env;
