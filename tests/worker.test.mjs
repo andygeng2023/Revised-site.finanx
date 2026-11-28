@@ -232,7 +232,8 @@ test("index discovery runs continuously, respects 30000 caps, and recovers stale
   assert.match(source, /D1_WRITE_PAUSE_KEY/);
   assert.match(source, /queue completions immediately continue the scan pipeline/);
   const status = source.slice(source.indexOf("async function queueStatus"), source.indexOf("async function searchRoute"));
-  assert.match(status, /stage LIKE 'Scheduled % discovery refresh'/);
+  assert.match(status, /user_id IS NULL/);
+  assert.match(status, /user_id=\?/);
   const consumer = source.slice(source.indexOf("  async queue(batch,env){"), source.indexOf("  async scheduled(controller,env,ctx){"));
   assert.match(consumer, /completed\?\.jobType==="scan"/);
   assert.match(consumer, /refreshIndexes\(env,indexer\)/);
