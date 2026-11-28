@@ -417,7 +417,7 @@ async function refreshIndexes(env,indexer){
     batch.push({body:{jobId:id}});
     if(batch.length>=24)break;
   }
-  if(batch.length)await env.ANALYSIS_QUEUE.sendBatch(batch);
+  if(batch.length){const queue=indexer==="FullIndex"?env.FULLINDEX_QUEUE:env.ANALYSIS_QUEUE;if(!queue?.sendBatch)throw new Error(indexer+" queue binding is unavailable");await queue.sendBatch(batch);}
 }
 async function modelLearning(url,env){
   const indexer=(url.searchParams.get("indexer")||"PreviewIndex").toLowerCase()==="fullindex"?"FullIndex":"PreviewIndex";
