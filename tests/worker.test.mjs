@@ -33,7 +33,7 @@ function testEnv({ firstResult = null, failDatabase = false } = {}) {
       batch: async () => { calls.batches++; return []; }
     },
     ANALYSIS_QUEUE: { send: async () => { calls.queue++; }, sendBatch: async messages => { calls.batchMessages.push(...messages); } },
-    FULLINDEX_QUEUE: { sendBatch: async messages => { calls.batchMessages.push(...messages); } },
+    FULLINDEX_QUEUE: { send: async () => {}, sendBatch: async messages => { calls.batchMessages.push(...messages); } },
     calls
   };
   return env;
@@ -115,7 +115,17 @@ test("health endpoint verifies database and queue bindings", async () => {
   assert.equal(body.ok, true);
   assert.equal(body.database, "D1");
   assert.equal(body.queue, "Cloudflare Queues");
+  assert.equal(body.full_index_queue, "Bound");
   assert.ok(env.calls.sql.some(x => x.sql.includes("SELECT 1 AS ok")));
+});
+
+test("health endpoint reports a missing FullIndex queue binding", async () => {
+  const env = testEnv();
+  delete env.FULLINDEX_QUEUE;
+  const response = await worker.fetch(new Request("https://finanx.test/api/health"), env, { waitUntil() {} });
+  const body = await response.json();
+  assert.equal(response.status, 503);
+  assert.equal(body.full_index_queue, "Unavailable");
 });
 
 test("health endpoint reports a failed database check", async () => {
