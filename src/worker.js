@@ -187,9 +187,9 @@ async function enqueueJob(env,job){
 async function requestAnalysis(req,env){
   const body=await req.json().catch(()=>({})),ticker=String(body.ticker||"").trim().toUpperCase(),indexer=String(body.save_to_indexer||body.indexer||"PreviewIndex").toLowerCase()==="fullindex"?"FullIndex":"PreviewIndex";
   if(!validTicker(ticker))return json({error:"Enter a valid stock ticker."},400);
-  if(!await rateLimit(env,req,"analysis-request",90,3600000))return json({error:"Analysis request limit reached for this connection. Try later."},429);
   const period=indexer==="FullIndex"?"10y":"5y",horizon=Number(body.horizon??30),maxAge=indexer==="FullIndex"?24:8,hardRescan=body.hard_rescan===true;
   if(!Number.isInteger(horizon)||horizon<1||horizon>504)return json({error:"Horizon must be a whole number from 1 to 504 trading days."},400);
+  if(!await rateLimit(env,req,"analysis-request",90,3600000))return json({error:"Analysis request limit reached for this connection. Try later."},429);
   const cutoff=new Date(Date.now()-maxAge*3600000).toISOString();
   if(!hardRescan){
     const cached=await first(env,"SELECT result,indexed_at,source_job_id FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=? LIMIT 1",ticker,period,horizon,indexer,cutoff);
