@@ -183,7 +183,7 @@ test("market scan reads existing fresh indexes without enqueuing new work", asyn
   assert.equal(body.queued, 0);
   assert.deepEqual(body.items, []);
   assert.equal(env.calls.queue, 0);
-  assert.ok(env.calls.sql.some(x => x.sql.includes("INSERT INTO api_rate_limits")));
+  assert.equal(env.calls.sql.some(x => x.sql.includes("api_rate_limits")), false);
 });
 
 test("rejects unsupported analysis horizons", async () => {
@@ -211,20 +211,16 @@ test("hard rescan bypasses cache cooldown and is persisted for the queue consume
   assert.ok(insert.args.includes("hard_rescan"));
 });
 
-test("market feed serves its saved snapshot when upstream refreshes are rate-limited", async () => {
-  const env = testEnv({
-    firstResult: sql => sql.includes("INSERT INTO api_rate_limits") ? { attempts: 16 } : null
-  });
-  const response = await worker.fetch(new Request("https://finanx.test/api/market-feed"), env, { waitUntil() {} });
-  const body = await response.json();
-  assert.equal(response.status, 200);
-  assert.equal(body.stale, true);
-  assert.equal(body.refresh_limited, true);
-  assert.ok(Array.isArray(body.items));
-  assert.ok(body.items.length > 0);
-  assert.equal(body.items[0].price, null);
-  assert.ok(env.calls.sql.some(x => x.sql.includes("FROM market_quotes")));
-  assert.equal(env.calls.batches, 0);
+test("auth rate limits do not write counters to D1", async () => {
+  const env = testEnv();
+  const request = () => worker.fetch(new Request("https://finanx.test/api/auth/signup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "cf-connecting-ip": "203.0.113.240" },
+    body: JSON.stringify({ email: "invalid-email", password: "not-a-valid-signup" })
+  }), env, { waitUntil() {} });
+  for (let i = 0; i < 5; i++) assert.equal((await request()).status, 400);
+  assert.equal((await request()).status, 429);
+  assert.equal(env.calls.sql.some(x => x.sql.includes("api_rate_limits")), false);
 });
 
 test("FullIndex uses 15 original models, 10 hybrids, 3 meta-hybrids and one primary", () => {
@@ -262,10 +258,10 @@ test("PreviewIndex keeps a smaller candidate set while retaining all hybrid laye
   assert.equal(candidates.filter(x => x.type === "Primary hybrid").length, 1);
 });
 
-test("scheduled index refreshes alternate between PreviewIndex and FullIndex every two minutes", async () => {
+test("scheduled index refreshes are limited to four batches per day per index", async () => {
   const envPreview = testEnv();
   const previewPromises = [];
-  worker.scheduled({ cron: "*/2 * * * *" }, envPreview, { waitUntil: promise => previewPromises.push(promise) });
+  worker.scheduled({ cron: "0 */6 * * *" }, envPreview, { waitUntil: promise => previewPromises.push(promise) });
   await Promise.all(previewPromises);
   const previewInsert = envPreview.calls.sql.find(x => x.sql.includes("INSERT INTO analysis_jobs"));
   assert.ok(previewInsert, "Preview schedule must enqueue index work");
@@ -274,10 +270,17 @@ test("scheduled index refreshes alternate between PreviewIndex and FullIndex eve
 
   const envFull = testEnv();
   const fullPromises = [];
-  worker.scheduled({ cron: "1-59/2 * * * *" }, envFull, { waitUntil: promise => fullPromises.push(promise) });
+  worker.scheduled({ cron: "30 */6 * * *" }, envFull, { waitUntil: promise => fullPromises.push(promise) });
   await Promise.all(fullPromises);
   const fullInsert = envFull.calls.sql.find(x => x.sql.includes("INSERT INTO analysis_jobs"));
   assert.ok(fullInsert, "Full schedule must enqueue index work");
   assert.equal(fullInsert.args[4], "FullIndex");
   assert.ok(envFull.calls.batchMessages.length > 0);
+});
+
+
+test("Worker PBKDF2 iterations stay within the WebCrypto limit", async () => {
+  const source = await readFile(new URL("../src/worker.js", import.meta.url), "utf8");
+  assert.match(source, /iterations:100000,hash:"SHA-256"/);
+  assert.match(source, /const dailyVol=.*\n  const rawModelSignal=.*newsAdjustment=/);
 });
