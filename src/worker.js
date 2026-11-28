@@ -263,16 +263,16 @@ async function marketFeed(url,env,req){
     }catch{return json({suggestions:[]});}
   }
 
-  if(!await rateLimit(env,req,"market-feed",15,60000))return json({error:"Market feed refresh limit reached. Try again shortly."},429);
-
-  // Keep the universe bounded so even a provider fallback stays within Worker subrequest limits.
+  // A throttled refresh must not make the market disappear. Read the D1 snapshot
+  // first and serve it even when this IP has reached the upstream-refresh limit.
+  const refreshAllowed=await rateLimit(env,req,"market-feed",15,60000);
   const [catalog,indexedTickers]=await Promise.all([
     all(env,"SELECT ticker,company,currency FROM ticker_catalog ORDER BY COALESCE(last_indexed_at,'') DESC LIMIT 60"),
     all(env,"SELECT ticker,MAX(indexed_at) AS latest FROM market_index GROUP BY ticker ORDER BY latest DESC LIMIT 100")
   ]);
   const tickers=POPULAR.slice(0,8).concat(indexedTickers.map(x=>x.ticker),catalog.map(x=>x.ticker),POPULAR.slice(8))
     .filter((ticker,index,items)=>validTicker(ticker)&&items.indexOf(ticker)===index).slice(0,24);
-  if(!tickers.length)return json({items:[],generated_at:isoNow(),index_counts:{PreviewIndex:0,FullIndex:0}});
+  if(!tickers.length)return json({items:[],generated_at:isoNow(),index_counts:{PreviewIndex:0,FullIndex:0},stale:!refreshAllowed,refresh_limited:!refreshAllowed});
 
   const placeholders=tickers.map(()=>"?").join(",");
   const [quoteRows,indexRows]=await Promise.all([
@@ -288,7 +288,11 @@ async function marketFeed(url,env,req){
       (row.indexer===existing.indexer&&row.indexed_at>existing.indexed_at))indexesByTicker.set(row.ticker,row);
   }
 
-  const refreshed=await mapLimit(tickers,6,async ticker=>{
+  const cachedItems=tickers.map(ticker=>{
+    const cached=quotesByTicker.get(ticker);
+    return {ticker,quote:cached||{ticker,company:catalogByTicker.get(ticker)?.company||ticker,currency:catalogByTicker.get(ticker)?.currency||"USD",price:null,change_percent:null,as_of:null,source:"Quote temporarily unavailable"}};
+  });
+  const refreshed=refreshAllowed?await mapLimit(tickers,6,async ticker=>{
     const cached=quotesByTicker.get(ticker)||null;
     const cacheFresh=cached&&Date.now()-Date.parse(cached.updated_at||"")<5*60000;
     if(cacheFresh)return {ticker,quote:cached};
@@ -296,13 +300,13 @@ async function marketFeed(url,env,req){
       const quote=await yahooChart(ticker,"1y");
       return {ticker,quote};
     }catch{
-      // Prefer an explicitly timestamped cached quote over dropping a still-useful index result.
+      // A provider outage falls back to the last saved quote, not an empty feed.
       return {ticker,quote:cached||{ticker,company:catalogByTicker.get(ticker)?.company||ticker,currency:catalogByTicker.get(ticker)?.currency||"USD",price:null,change_percent:null,as_of:null,source:"Quote temporarily unavailable"}};
     }
-  });
+  }):cachedItems;
 
   const now=isoNow(),statements=[];
-  for(const item of refreshed){
+  if(refreshAllowed)for(const item of refreshed){
     const quote=item.quote;
     if(quote.price!=null&&quote.company){
       statements.push(stmt(env,"INSERT INTO market_quotes(ticker,company,currency,price,change_percent,as_of,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,price=excluded.price,change_percent=excluded.change_percent,as_of=excluded.as_of,source=excluded.source,updated_at=excluded.updated_at",item.ticker,quote.company,quote.currency||"USD",quote.price,quote.change_percent??null,quote.as_of||null,quote.source||"Yahoo Finance chart data",now));
@@ -329,7 +333,7 @@ async function marketFeed(url,env,req){
   });
   const counts={PreviewIndex:0,FullIndex:0};
   for(const item of items)if(item.indexer)counts[item.indexer]++;
-  return json({items,generated_at:now,index_counts:counts});
+  return json({items,generated_at:now,index_counts:counts,stale:!refreshAllowed,refresh_limited:!refreshAllowed,message:refreshAllowed?"Market snapshot refreshed.":"Refresh limit reached; serving the saved D1 snapshot."});
 }
 async function watchlist(req,env){
   const user=await authUser(req,env);if(!user)return json({error:"Sign in to use your watchlist."},401);
@@ -374,8 +378,8 @@ async function requestMarketScan(req,env){
 }
 async function listJobs(req,env){
   const user=await authUser(req,env);
-  if(user)return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,status,progress,stage,updated_at FROM analysis_jobs WHERE user_id=? OR job_type='scan' ORDER BY created_at DESC LIMIT 40",user.id)});
-  return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,status,progress,stage,updated_at FROM analysis_jobs WHERE job_type='scan' ORDER BY created_at DESC LIMIT 24")});
+  if(user)return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,job_type,status,progress,stage,updated_at FROM analysis_jobs WHERE user_id=? OR job_type='scan' ORDER BY created_at DESC LIMIT 40",user.id)});
+  return json({jobs:await all(env,"SELECT id,ticker,save_to_indexer AS indexer,job_type,status,progress,stage,updated_at FROM analysis_jobs WHERE job_type='scan' ORDER BY created_at DESC LIMIT 24")});
 }
 async function processJob(id,env){
   const job=await first(env,"SELECT * FROM analysis_jobs WHERE id=?",id);

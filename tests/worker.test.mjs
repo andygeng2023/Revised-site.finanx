@@ -46,9 +46,11 @@ test("serves the Finanx application and core pages", async () => {
   assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
   const html = await response.text();
   for (const marker of [
-    "Market intelligence", "Stocks to explore", "Market Scan", "PreviewIndex",
-    "FullIndex", "stock-chart", "history-chart", "home-featured-cards",
-    "discover-featured-cards", "Analysis history", "Watchlist", "settings-grid"
+    "Market intelligence", "Market pulse", "Top advancing", "Top declining", "Stocks to explore",
+    "Market Scan", "PreviewIndex", "FullIndex", "stock-chart", "history-chart",
+    "home-featured-cards", "discover-featured-cards", "Forecast leaders", "Recently analysed",
+    "Your saved instruments", "Shared model learning", "Analysis history", "Watchlist", "settings-grid",
+    "Background processing", "Validation & limitations"
   ]) assert.ok(html.includes(marker), `Missing page marker: ${marker}`);
   assert.doesNotMatch(html, /Market Activity|market-activity/);
   assert.match(html, /\.cards:not\(\.scan-rail\)\{display:grid!important/);
@@ -189,13 +191,20 @@ test("hard rescan bypasses cache cooldown and is persisted for the queue consume
   assert.ok(insert.args.includes("hard_rescan"));
 });
 
-test("market feed rate limit stops excessive refresh requests", async () => {
+test("market feed serves its saved snapshot when upstream refreshes are rate-limited", async () => {
   const env = testEnv({
     firstResult: sql => sql.includes("INSERT INTO api_rate_limits") ? { attempts: 16 } : null
   });
   const response = await worker.fetch(new Request("https://finanx.test/api/market-feed"), env, { waitUntil() {} });
-  assert.equal(response.status, 429);
-  assert.equal(env.calls.sql.length, 1);
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.stale, true);
+  assert.equal(body.refresh_limited, true);
+  assert.ok(Array.isArray(body.items));
+  assert.ok(body.items.length > 0);
+  assert.equal(body.items[0].price, null);
+  assert.ok(env.calls.sql.some(x => x.sql.includes("FROM market_quotes")));
+  assert.equal(env.calls.batches, 0);
 });
 
 test("FullIndex uses 15 original models, 10 hybrids, 3 meta-hybrids and one primary", () => {
