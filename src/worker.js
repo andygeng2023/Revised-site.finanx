@@ -712,9 +712,12 @@ async function modelLearning(url,env){
 }
 async function queueStatus(req,env){
   const user=await authUser(req,env),cutoff=new Date(Date.now()-7*86400000).toISOString();
+  // The queue-status endpoint measures all background work, including anonymous
+  // analysis jobs. Restricting it to job_type='scan' hid older scanner jobs because
+  // those rows were created before the scan type was assigned.
   const rows=user
-    ? await all(env,"SELECT status,COUNT(*) AS count FROM analysis_jobs WHERE (user_id=? OR job_type='scan' OR (user_id IS NULL AND stage LIKE 'Scheduled % discovery refresh')) AND created_at>=? GROUP BY status",user.id,cutoff)
-    : await all(env,"SELECT status,COUNT(*) AS count FROM analysis_jobs WHERE (job_type='scan' OR (user_id IS NULL AND stage LIKE 'Scheduled % discovery refresh')) AND created_at>=? GROUP BY status",cutoff);
+    ? await all(env,"SELECT status,COUNT(*) AS count FROM analysis_jobs WHERE (user_id=? OR user_id IS NULL) AND created_at>=? GROUP BY status",user.id,cutoff)
+    : await all(env,"SELECT status,COUNT(*) AS count FROM analysis_jobs WHERE user_id IS NULL AND created_at>=? GROUP BY status",cutoff);
   const counts={queued:0,running:0,completed:0,failed:0};
   for(const row of rows)counts[row.status]=(counts[row.status]||0)+Number(row.count||0);
   return json({counts,active:counts.queued+counts.running,total:Object.values(counts).reduce((a,b)=>a+b,0),updated_at:isoNow()});
