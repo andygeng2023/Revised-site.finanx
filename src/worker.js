@@ -10,6 +10,7 @@ const CORS = {
 const POPULAR = ["AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA","BRK-B","JPM","LLY","AVGO","COST","AMD","NFLX","ORCL","CRM","ADBE","QCOM","INTC","WMT","HD","PG","KO","PEP","BAC","XOM","CVX","UNH","V","MA","DIS","UBER","PLTR","SHOP","SNOW","SPY","QQQ","DIA","IWM"];
 const PREVIEW_VERSION = "finanx-preview-1";
 const FULL_VERSION = "finanx-full-1";
+const localRateLimits = new Map();
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, Number.isFinite(n) ? n : 0));
 const isoNow = () => new Date().toISOString();
 const json = (body,status=200,extra={}) => new Response(JSON.stringify(body),{status,headers:{...CORS,"Cache-Control":"no-store",...extra}});
@@ -24,7 +25,7 @@ const sha = async value => hex(await crypto.subtle.digest("SHA-256",new TextEnco
 const random = size => { const bytes=crypto.getRandomValues(new Uint8Array(size));return btoa(String.fromCharCode(...bytes)).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); };
 async function passwordHash(password,salt){
   const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveBits"]);
-  const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt:new Uint8Array(salt.match(/.{2}/g).map(x=>parseInt(x,16))),iterations:110000,hash:"SHA-256"},key,256);
+  const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt:new Uint8Array(salt.match(/.{2}/g).map(x=>parseInt(x,16))),iterations:100000,hash:"SHA-256"},key,256);
   return hex(bits);
 }
 function tokenFrom(req){return (req.headers.get("Authorization")||"").replace(/^Bearer\s+/i,"").trim();}
@@ -39,9 +40,20 @@ async function authUser(req,env){
   return first(env,"SELECT u.id,u.email,u.display_name,u.created_at,u.last_sign_in_at,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?",await sha(token),isoNow());
 }
 async function rateLimit(env,req,key,max,windowMs){
-  const ip=(req.headers.get("cf-connecting-ip")||"unknown").slice(0,80),bucket=await sha(key+":"+ip),now=Date.now(),cut=now-windowMs;
-  const row=await first(env,"INSERT INTO api_rate_limits(bucket_key,window_start,attempts) VALUES(?,?,1) ON CONFLICT(bucket_key) DO UPDATE SET attempts=CASE WHEN api_rate_limits.window_start<=? THEN 1 ELSE api_rate_limits.attempts+1 END,window_start=CASE WHEN api_rate_limits.window_start<=? THEN ? ELSE api_rate_limits.window_start END RETURNING attempts",bucket,now,cut,cut,now);
-  return Number(row?.attempts||0)<=max;
+  // Per-isolate best-effort throttling avoids a D1 write on every API request.
+  // D1 is a shared daily quota; persisting every rate-limit counter exhausted it.
+  const ip=(req.headers.get("cf-connecting-ip")||"unknown").slice(0,80),bucket=key+":"+ip,now=Date.now();
+  let entry=localRateLimits.get(bucket);
+  if(!entry||entry.resetAt<=now)entry={count:0,resetAt:now+windowMs};
+  entry.count++;
+  localRateLimits.set(bucket,entry);
+  if(localRateLimits.size>5000){
+    for(const [storedKey,storedValue] of localRateLimits){
+      if(storedValue.resetAt<=now)localRateLimits.delete(storedKey);
+      if(localRateLimits.size<=4000)break;
+    }
+  }
+  return entry.count<=max;
 }
 async function authRoute(req,env,url){
   const route=url.pathname.split("/").pop(),method=req.method;
@@ -160,8 +172,8 @@ async function makeAnalysis(env,job){
   const original=getOriginalPredictions(closes,volumes);
   const predictions=ensemblePredictions(original.predictions,globalWeights,full);
   const candidates=modelCandidates(predictions,evaluation.stats,globalWeights);
-  const rawModelSignal=clamp(Number(predictions.primary||0),-0.02,0.02),newsAdjustment=clamp(Number(newsContext.temporal.signal||0)*dailyVol*.025,-.0008,.0008),dailySignal=clamp(rawModelSignal+newsAdjustment,-0.02,0.02);
   const dailyVol=Number(original.diagnostics.volatility||0.015);
+  const rawModelSignal=clamp(Number(predictions.primary||0),-0.02,0.02),newsAdjustment=clamp(Number(newsContext.temporal.signal||0)*dailyVol*.025,-.0008,.0008),dailySignal=clamp(rawModelSignal+newsAdjustment,-0.02,0.02);
   let cumulative=0;
   const forecast=[],lower=[],upper=[];
   for(let i=1;i<=horizon;i++){
@@ -500,7 +512,7 @@ async function refreshIndexes(env,indexer){
     const id=crypto.randomUUID(),created=isoNow();
     await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,save_to_indexer,status,created_at,updated_at,stage,progress) VALUES(?,?,?,?,?,'queued',?,?,?,0)",id,ticker,period,horizon,indexer,created,created,"Scheduled "+indexer+" discovery refresh");
     batch.push({body:{jobId:id}});
-    if(batch.length>=8)break;
+    if(batch.length>=4)break;
   }
   if(batch.length){const queue=indexer==="FullIndex"?env.FULLINDEX_QUEUE:env.PREVIEWINDEX_QUEUE;if(!queue?.sendBatch)throw new Error(indexer+" queue binding is unavailable");await queue.sendBatch(batch);}
 }
@@ -579,10 +591,11 @@ export default {
   },
   async scheduled(controller,env,ctx){
     const cron=controller.cron||"";
-    if(cron==="1-59/2 * * * *")ctx.waitUntil(refreshIndexes(env,"FullIndex"));
-    else ctx.waitUntil(refreshIndexes(env,"PreviewIndex"));
-    ctx.waitUntil(run(env,"DELETE FROM sessions WHERE expires_at<?",isoNow()));
-    ctx.waitUntil(run(env,"DELETE FROM analysis_jobs WHERE status IN ('completed','failed') AND updated_at<?",new Date(Date.now()-14*86400000).toISOString()));
-    ctx.waitUntil(run(env,"DELETE FROM api_rate_limits WHERE window_start<?",Date.now()-24*3600000));
+    if(cron==="30 */6 * * *")ctx.waitUntil(refreshIndexes(env,"FullIndex"));
+    if(cron==="0 */6 * * *"){
+      ctx.waitUntil(refreshIndexes(env,"PreviewIndex"));
+      ctx.waitUntil(run(env,"DELETE FROM sessions WHERE expires_at<?",isoNow()));
+      ctx.waitUntil(run(env,"DELETE FROM analysis_jobs WHERE status IN ('completed','failed') AND updated_at<?",new Date(Date.now()-14*86400000).toISOString()));
+    }
   }
 };
