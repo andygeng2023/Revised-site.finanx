@@ -732,10 +732,15 @@ export default {
   async scheduled(controller,env,ctx){
     const cron=controller.cron||"";
     if(cron==="30 */8 * * *")ctx.waitUntil(refreshIndexes(env,"FullIndex"));
-    if(cron==="0 */8 * * *")ctx.waitUntil(refreshIndexes(env,"PreviewIndex"));
-    if(cron==="0 5 * * 0"){
-      ctx.waitUntil(run(env,"DELETE FROM sessions WHERE expires_at<?",isoNow()));
-      ctx.waitUntil(run(env,"DELETE FROM analysis_jobs WHERE status IN ('completed','failed') AND updated_at<?",new Date(Date.now()-14*86400000).toISOString()));
+    if(cron==="0 */8 * * *"){
+      ctx.waitUntil(refreshIndexes(env,"PreviewIndex"));
+      const scheduledAt=new Date(Number(controller.scheduledTime||Date.now()));
+      // The PreviewIndex cron also runs at Sunday 00:00 UTC; do housekeeping there
+      // instead of adding another cron trigger and another scheduled invocation.
+      if(scheduledAt.getUTCDay()===0&&scheduledAt.getUTCHours()===0){
+        ctx.waitUntil(run(env,"DELETE FROM sessions WHERE expires_at<?",isoNow()));
+        ctx.waitUntil(run(env,"DELETE FROM analysis_jobs WHERE status IN ('completed','failed') AND updated_at<?",new Date(Date.now()-14*86400000).toISOString()));
+      }
     }
   }
 };

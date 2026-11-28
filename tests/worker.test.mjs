@@ -333,7 +333,7 @@ test("scheduled index refreshes use an eight-hour cadence and remain capped at f
 test("weekly housekeeping is separated from index refreshes", async () => {
   const env = testEnv();
   const promises = [];
-  worker.scheduled({ cron: "0 5 * * 0" }, env, { waitUntil: promise => promises.push(promise) });
+  worker.scheduled({ cron: "0 */8 * * *", scheduledTime: Date.UTC(2026, 10, 29, 0, 0, 0) }, env, { waitUntil: promise => promises.push(promise) });
   await Promise.all(promises);
   assert.ok(env.calls.sql.some(call => call.sql.includes("DELETE FROM sessions")));
   assert.ok(env.calls.sql.some(call => call.sql.includes("DELETE FROM analysis_jobs")));
