@@ -61,5 +61,11 @@
       "0 */6 * * *",
       "30 */6 * * *"
     ]
-  }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "AUTH_KV",
+      "id": "8b64b52a1fb04d57a7d6f4416c61dc48"
+    }
+  ]
 }
