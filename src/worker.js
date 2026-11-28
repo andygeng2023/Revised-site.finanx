@@ -35,9 +35,27 @@ async function createSession(env,userId){
   await run(env,"INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)",await sha(token),userId,now,expires);
   return {access_token:token,token_type:"bearer",expires_at:Math.floor(Date.now()/1000)+2592000};
 }
+async function createKvSession(env,user){
+  if(!env.AUTH_KV)throw new Error("Authentication fallback storage is not configured.");
+  const token=random(32),expires=new Date(Date.now()+30*86400000).toISOString();
+  await env.AUTH_KV.put("session:"+await sha(token),JSON.stringify({email:user.email,expires_at:expires,session_version:Number(user.session_version||0)}),{expirationTtl:2592000});
+  return {access_token:token,token_type:"bearer",expires_at:Math.floor(Date.now()/1000)+2592000};
+}
 async function authUser(req,env){
   const token=tokenFrom(req);if(!token)return null;
-  return first(env,"SELECT u.id,u.email,u.display_name,u.created_at,u.last_sign_in_at,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?",await sha(token),isoNow());
+  const tokenHash=await sha(token);
+  try{
+    const databaseUser=await first(env,"SELECT u.id,u.email,u.display_name,u.created_at,u.last_sign_in_at,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?",tokenHash,isoNow());
+    if(databaseUser)return databaseUser;
+  }catch(error){
+    console.warn("Finanx D1 session lookup unavailable; checking fallback auth storage.",String(error?.message||error));
+  }
+  if(!env.AUTH_KV)return null;
+  const session=await env.AUTH_KV.get("session:"+tokenHash,"json");
+  if(!session||!session.expires_at||Date.parse(session.expires_at)<=Date.now())return null;
+  const user=await env.AUTH_KV.get("user-email:"+session.email,"json");
+  if(!user||Number(session.session_version||0)!==Number(user.session_version||0))return null;
+  return {...user,expires_at:session.expires_at};
 }
 async function rateLimit(env,req,key,max,windowMs){
   // Per-isolate best-effort throttling avoids a D1 write on every API request.
@@ -61,42 +79,106 @@ async function authRoute(req,env,url){
   if(["signup","login"].includes(route)&&!await rateLimit(env,req,"auth-"+route,route==="signup"?5:12,3600000))return json({error:"Too many attempts. Try again later."},429);
   if(route==="signup"&&method==="POST"){
     const email=String(body.email||"").trim().toLowerCase(),password=String(body.password||"");
-    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Enter a valid email and a password of at least 8 characters."},400);
+    if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Enter a valid email and a password of at least 8 characters."},400);
+    if(env.AUTH_KV){
+      const existing=await env.AUTH_KV.get("user-email:"+email,"json");
+      if(existing)return json({error:"An account with that email already exists."},409);
+    }
     let salt,hash,id,created;
     try{salt=hex(crypto.getRandomValues(new Uint8Array(16)));hash=await passwordHash(password,salt);id=crypto.randomUUID();created=isoNow();}
     catch(error){console.error("Finanx signup stage: password preparation",error);return json({error:"Signup failed at password preparation (AUTH-01)."},500);}
-    try{await run(env,"INSERT INTO users(id,email,password_hash,password_salt,created_at,last_sign_in_at) VALUES(?,?,?,?,?,?)",id,email,hash,salt,created,created);}
-    catch(error){const message=String(error?.message||error);if(/unique constraint|constraint failed.*users\.email|users\.email.*unique/i.test(message))return json({error:"An account with that email already exists."},409);console.error("Finanx signup stage: user insert",error);return json({error:"Signup failed at account creation (AUTH-02)."},500);}
+    const user={id,email,password_hash:hash,password_salt:salt,display_name:"",created_at:created,last_sign_in_at:created,auth_store:"d1",session_version:0};
     let session;
-    try{session=await createSession(env,id);}
-    catch(error){console.error("Finanx signup stage: session creation",error);return json({error:"Account created but session setup failed (AUTH-03)."},500);}
-    const user={id,email,display_name:"",created_at:created,last_sign_in_at:created};
-    return json({user,session:{...session,user}},201);
+    try{
+      await run(env,"INSERT INTO users(id,email,password_hash,password_salt,created_at,last_sign_in_at) VALUES(?,?,?,?,?,?)",id,email,hash,salt,created,created);
+      try{session=await createSession(env,id);}
+      catch(error){
+        if(!env.AUTH_KV)throw error;
+        console.warn("Finanx signup: D1 session insert unavailable; using EU KV session storage.",String(error?.message||error));
+        user.auth_store="kv";
+        await env.AUTH_KV.put("user-email:"+email,JSON.stringify(user));
+        session=await createKvSession(env,user);
+      }
+    }catch(error){
+      const message=String(error?.message||error);
+      if(/unique constraint|constraint failed.*users\\.email|users\\.email.*unique/i.test(message))return json({error:"An account with that email already exists."},409);
+      if(!env.AUTH_KV){console.error("Finanx signup stage: user insert",error);return json({error:"Signup failed at account creation (AUTH-02)."},500);}
+      console.warn("Finanx signup: D1 write unavailable; saving the account in EU KV.",message);
+      user.auth_store="kv";
+      try{
+        await env.AUTH_KV.put("user-email:"+email,JSON.stringify(user));
+        session=await createKvSession(env,user);
+      }catch(kvError){
+        console.error("Finanx signup fallback storage failed",kvError);
+        return json({error:"Signup storage is temporarily unavailable (AUTH-04)."},503);
+      }
+    }
+    return json({user:userShape(user),session:{...session,user:userShape(user)}},201);
   }
   if(route==="login"&&method==="POST"){
     const email=String(body.email||"").trim().toLowerCase(),password=String(body.password||"");
-    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Email or password is incorrect."},401);
-    const row=await first(env,"SELECT * FROM users WHERE email=? COLLATE NOCASE",email);
+    if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)||password.length<8||password.length>256)return json({error:"Email or password is incorrect."},401);
+    let row=null,source="d1";
+    try{row=await first(env,"SELECT * FROM users WHERE email=? COLLATE NOCASE",email);}
+    catch(error){console.warn("Finanx D1 credential lookup unavailable; checking EU KV.",String(error?.message||error));}
+    if(!row&&env.AUTH_KV){
+      row=await env.AUTH_KV.get("user-email:"+email,"json");
+      if(row)source="kv";
+    }
     if(!row||await passwordHash(password,row.password_salt)!==row.password_hash)return json({error:"Email or password is incorrect."},401);
-    const signed=isoNow();await run(env,"UPDATE users SET last_sign_in_at=? WHERE id=?",signed,row.id);
-    const session=await createSession(env,row.id),user=userShape({...row,last_sign_in_at:signed});
-    return json({user,session:{...session,user}});
+    const signed=isoNow();row.last_sign_in_at=signed;
+    if(source==="kv"||row.auth_store==="kv"){
+      row.auth_store="kv";
+      await env.AUTH_KV.put("user-email:"+email,JSON.stringify(row));
+      const session=await createKvSession(env,row),user=userShape(row);
+      return json({user,session:{...session,user}});
+    }
+    try{
+      await run(env,"UPDATE users SET last_sign_in_at=? WHERE id=?",signed,row.id);
+      const session=await createSession(env,row.id),user=userShape(row);
+      return json({user,session:{...session,user}});
+    }catch(error){
+      if(!env.AUTH_KV)throw error;
+      console.warn("Finanx login: D1 session unavailable; using EU KV session storage.",String(error?.message||error));
+      row.auth_store="kv";
+      await env.AUTH_KV.put("user-email:"+email,JSON.stringify(row));
+      const session=await createKvSession(env,row),user=userShape(row);
+      return json({user,session:{...session,user}});
+    }
   }
   if(route==="me"&&method==="GET"){
     const user=await authUser(req,env);if(!user)return json({error:"Your session has expired. Sign in again."},401);
     return json({user:userShape(user)});
   }
   if(route==="logout"&&method==="POST"){
-    const token=tokenFrom(req);if(token)await run(env,"DELETE FROM sessions WHERE token_hash=?",await sha(token));
+    const token=tokenFrom(req);
+    if(token){
+      const tokenHash=await sha(token);
+      try{await run(env,"DELETE FROM sessions WHERE token_hash=?",tokenHash);}catch(error){console.warn("Finanx D1 logout cleanup unavailable.",String(error?.message||error));}
+      if(env.AUTH_KV)await env.AUTH_KV.delete("session:"+tokenHash);
+    }
     return json({success:true});
   }
   if(route==="password"&&method==="PATCH"){
     const user=await authUser(req,env);if(!user)return json({error:"Sign in again."},401);
     const password=String(body.password||"");if(password.length<8||password.length>256)return json({error:"Password must contain at least 8 characters."},400);
-    const salt=hex(crypto.getRandomValues(new Uint8Array(16))),hash=await passwordHash(password,salt),tokenHash=await sha(tokenFrom(req));
+    const salt=hex(crypto.getRandomValues(new Uint8Array(16))),hash=await passwordHash(password,salt);
+    if(user.auth_store==="kv"){
+      const stored=await env.AUTH_KV.get("user-email:"+user.email,"json");
+      if(!stored)return json({error:"Account record not found."},404);
+      stored.password_hash=hash;stored.password_salt=salt;stored.session_version=Number(stored.session_version||0)+1;
+      await env.AUTH_KV.put("user-email:"+user.email,JSON.stringify(stored));
+      const tokenHash=await sha(tokenFrom(req)),session=await env.AUTH_KV.get("session:"+tokenHash,"json");
+      if(session){
+        session.session_version=stored.session_version;
+        const ttl=Math.max(60,Math.ceil((Date.parse(session.expires_at)-Date.now())/1000));
+        await env.AUTH_KV.put("session:"+tokenHash,JSON.stringify(session),{expirationTtl:ttl});
+      }
+      return json({success:true,sessions_revoked:true});
+    }
     await env.DB.batch([
       stmt(env,"UPDATE users SET password_hash=?,password_salt=? WHERE id=?",hash,salt,user.id),
-      stmt(env,"DELETE FROM sessions WHERE user_id=? AND token_hash<>?",user.id,tokenHash)
+      stmt(env,"DELETE FROM sessions WHERE user_id=? AND token_hash<>?",user.id,await sha(tokenFrom(req)))
     ]);
     return json({success:true,sessions_revoked:true});
   }
