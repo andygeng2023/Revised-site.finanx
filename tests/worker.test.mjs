@@ -6,7 +6,7 @@ import worker from "../src/worker.js";
 import { getOriginalPredictions, ensemblePredictions, buildModelEvaluation, modelCandidates } from "../src/models.js";
 
 function testEnv({ firstResult = null, failDatabase = false } = {}) {
-  const calls = { sql: [], queue: 0, batches: 0 };
+  const calls = { sql: [], queue: 0, batches: 0, batchMessages: [] };
   const env = {
     DB: {
       prepare(sql) {
@@ -32,7 +32,7 @@ function testEnv({ firstResult = null, failDatabase = false } = {}) {
       },
       batch: async () => { calls.batches++; return []; }
     },
-    ANALYSIS_QUEUE: { send: async () => { calls.queue++; } },
+    ANALYSIS_QUEUE: { send: async () => { calls.queue++; }, sendBatch: async messages => { calls.batchMessages.push(...messages); } },
     calls
   };
   return env;
@@ -248,4 +248,24 @@ test("PreviewIndex keeps a smaller candidate set while retaining all hybrid laye
   assert.equal(candidates.filter(x => x.type === "Hybrid").length, 10);
   assert.equal(candidates.filter(x => x.type === "Meta-hybrid").length, 3);
   assert.equal(candidates.filter(x => x.type === "Primary hybrid").length, 1);
+});
+
+test("scheduled index refreshes alternate between PreviewIndex and FullIndex every two minutes", async () => {
+  const envPreview = testEnv();
+  const previewPromises = [];
+  worker.scheduled({ cron: "*/2 * * * *" }, envPreview, { waitUntil: promise => previewPromises.push(promise) });
+  await Promise.all(previewPromises);
+  const previewInsert = envPreview.calls.sql.find(x => x.sql.includes("INSERT INTO analysis_jobs"));
+  assert.ok(previewInsert, "Preview schedule must enqueue index work");
+  assert.equal(previewInsert.args[4], "PreviewIndex");
+  assert.ok(envPreview.calls.batchMessages.length > 0);
+
+  const envFull = testEnv();
+  const fullPromises = [];
+  worker.scheduled({ cron: "1-59/2 * * * *" }, envFull, { waitUntil: promise => fullPromises.push(promise) });
+  await Promise.all(fullPromises);
+  const fullInsert = envFull.calls.sql.find(x => x.sql.includes("INSERT INTO analysis_jobs"));
+  assert.ok(fullInsert, "Full schedule must enqueue index work");
+  assert.equal(fullInsert.args[4], "FullIndex");
+  assert.ok(envFull.calls.batchMessages.length > 0);
 });
