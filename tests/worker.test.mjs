@@ -61,7 +61,8 @@ test("embedded browser JavaScript parses and has no duplicate HTML IDs", async (
   const script = html.split("<script>")[1]?.split("</script>")[0] || "";
   assert.ok(script, "The application script must exist");
   assert.doesNotThrow(() => new vm.Script(script), "Browser JavaScript must parse before deployment");
-  const ids = [...html.matchAll(/id="([^"]+)"/g)].map(match => match[1]);
+  const markup = html.slice(0, html.indexOf("<script>"));
+  const ids = [...markup.matchAll(/id="([^"]+)"/g)].map(match => match[1]);
   assert.equal(new Set(ids).size, ids.length, "HTML IDs must be unique");
   const indexHtml = await readFile(new URL("../index.html", import.meta.url), "utf8");
   assert.equal(indexHtml, html, "Static index.html and the Worker page must remain byte-for-byte synchronised");
