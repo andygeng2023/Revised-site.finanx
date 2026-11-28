@@ -10,7 +10,9 @@ const CORS = {
 const POPULAR = ["AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA","BRK-B","JPM","LLY","AVGO","COST","AMD","NFLX","ORCL","CRM","ADBE","QCOM","INTC","WMT","HD","PG","KO","PEP","BAC","XOM","CVX","UNH","V","MA","DIS","UBER","PLTR","SHOP","SNOW","SPY","QQQ","DIA","IWM"];
 const PREVIEW_VERSION = "finanx-preview-1";
 const FULL_VERSION = "finanx-full-1";
+const INDEX_CACHE_HOURS = 8;
 const localRateLimits = new Map();
+const localMarketQuotes = new Map();
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, Number.isFinite(n) ? n : 0));
 const isoNow = () => new Date().toISOString();
 const json = (body,status=200,extra={}) => new Response(JSON.stringify(body),{status,headers:{...CORS,"Cache-Control":"no-store",...extra}});
@@ -230,31 +232,59 @@ function slope(values){
   values.forEach((v,i)=>{sx+=i;sy+=v;sxx+=i*i;sxy+=i*v;});
   const den=n*sxx-sx*sx;return den?((n*sxy-sx*sy)/den):0;
 }
-async function loadGlobalWeights(env,indexer){
+async function loadLegacyGlobalWeights(env,indexer){
   const prefix=indexer+":";
-  const rows=await all(env,"SELECT model_key,observations,correct,accuracy,weight FROM model_learning_state WHERE model_key LIKE ?",prefix+"%");
+  const rows=await all(env,"SELECT model_key,observations,correct,accuracy,weight,updated_at FROM model_learning_state WHERE model_key LIKE ?",prefix+"%");
   return Object.fromEntries(rows.map(row=>[row.model_key.slice(prefix.length),row]));
 }
+async function loadGlobalWeights(env,indexer){
+  if(env.AUTH_KV){
+    try{
+      const saved=await env.AUTH_KV.get("model-learning:"+indexer,"json");
+      if(saved?.weights&&typeof saved.weights==="object")return saved.weights;
+    }catch(error){console.warn("Finanx model profile KV read unavailable; using legacy D1 profiles.",String(error?.message||error));}
+  }
+  return loadLegacyGlobalWeights(env,indexer);
+}
 async function updateGlobalLearning(env,scoreMap,indexer){
-  const statements=Object.entries(scoreMap).filter(([,score])=>score.observations>0).map(([key,score])=>{
-    const accuracy=score.accuracy,modelKey=indexer+":"+key;
-    return stmt(env,"INSERT INTO model_learning_state(model_key,observations,correct,accuracy,weight,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(model_key) DO UPDATE SET observations=model_learning_state.observations+excluded.observations,correct=model_learning_state.correct+excluded.correct,accuracy=CAST(model_learning_state.correct+excluded.correct AS REAL)/(model_learning_state.observations+excluded.observations),weight=MAX(0.25,MIN(2.5,1.0+(CAST(model_learning_state.correct+excluded.correct AS REAL)/(model_learning_state.observations+excluded.observations)-0.5)*2.0)),updated_at=excluded.updated_at",modelKey,score.observations,score.correct,accuracy,clamp(0.8+accuracy,0.5,1.5),isoNow());
-  });
-  if(statements.length)await env.DB.batch(statements);
+  if(!env.AUTH_KV)return;
+  const key="model-learning:"+indexer;
+  try{
+    const saved=await env.AUTH_KV.get(key,"json");
+    // Rebuild model profiles once per day instead of writing 21–29 rows per index.
+    const lastUpdated=Date.parse(saved?.updated_at||"");
+    if(Number.isFinite(lastUpdated)&&Date.now()-lastUpdated<24*3600000)return;
+    const weights={...(saved?.weights&&typeof saved.weights==="object"?saved.weights:await loadLegacyGlobalWeights(env,indexer))};
+    const updated=isoNow();
+    for(const [modelKey,score] of Object.entries(scoreMap)){
+      if(!score||Number(score.observations||0)<=0)continue;
+      const previous=weights[modelKey]||{};
+      const observations=Number(previous.observations||0)+Number(score.observations||0);
+      const correct=Number(previous.correct||0)+Number(score.correct||0);
+      const accuracy=observations?correct/observations:0.5;
+      weights[modelKey]={model_key:indexer+":"+modelKey,observations,correct,accuracy,weight:clamp(1+(accuracy-0.5)*2,0.25,2.5),updated_at:updated};
+    }
+    await env.AUTH_KV.put(key,JSON.stringify({updated_at:updated,weights}),{expirationTtl:90*86400});
+  }catch(error){console.warn("Finanx model profile update skipped.",String(error?.message||error));}
+}
+async function updateJobProgress(env,id,progress,stage){
+  if(!env.AUTH_KV)return;
+  try{await env.AUTH_KV.put("analysis-progress:"+id,JSON.stringify({progress,stage,updated_at:isoNow()}),{expirationTtl:7*86400});}
+  catch(error){console.warn("Finanx progress snapshot skipped.",String(error?.message||error));}
 }
 async function makeAnalysis(env,job){
   const indexer=job.save_to_indexer==="FullIndex"?"FullIndex":"PreviewIndex";
   const period=indexer==="FullIndex"?"10y":(job.period||"5y");
-  await run(env,"UPDATE analysis_jobs SET status='running',progress=5,stage='Downloading and validating market history',updated_at=? WHERE id=?",isoNow(),job.id);
+  await updateJobProgress(env,job.id,5,"Downloading and validating market history");
   const quote=await yahooChart(job.ticker,period);
   const fundamentals=await yahooFundamentals(job.ticker),newsContext=await getTickerNews(job.ticker);
   const rows=quote.history,closes=rows.map(x=>x.close),volumes=rows.map(x=>x.volume||0),horizon=clamp(Number(job.horizon||30),1,504);
-  await run(env,"UPDATE analysis_jobs SET progress=27,stage='Evaluating chronological holdouts',updated_at=? WHERE id=?",isoNow(),job.id);
+  await updateJobProgress(env,job.id,27,"Evaluating chronological holdouts");
   const previousWeights=await loadGlobalWeights(env,indexer);
   const full=indexer==="FullIndex";
   const evaluation=buildModelEvaluation(closes,volumes,previousWeights,full);
   await updateGlobalLearning(env,evaluation.stats,indexer);
-  await run(env,"UPDATE analysis_jobs SET progress=57,stage='Updating global model profiles',updated_at=? WHERE id=?",isoNow(),job.id);
+  await updateJobProgress(env,job.id,57,"Updating global model profiles");
   const globalWeights=await loadGlobalWeights(env,indexer);
   const original=getOriginalPredictions(closes,volumes);
   const predictions=ensemblePredictions(original.predictions,globalWeights,full);
@@ -282,7 +312,7 @@ async function makeAnalysis(env,job){
     model:{version:modelVersion,primary:"Adaptive Primary Hybrid",original_count:full?15:7,hybrid_count:10,meta_count:3,metrics:{backtest:{directional_accuracy:Number(accuracy.toFixed(4)),validation_windows:evaluation.windows,validation_horizon:"1 trading day"}},learning_observations:candidates.reduce((sum,c)=>sum+c.observations,0),candidates},
     fundamentals:{...fundamentals,source:"Yahoo Finance quote summary"},news_context:{...newsContext.temporal,items:newsContext.items,signal_adjustment:Number(newsAdjustment.toFixed(6)),method:"Simple headline keyword signal blended at a low weight; time buckets are independently weighted and this is not a trained sentiment model."}
   };
-  await run(env,"UPDATE analysis_jobs SET progress=86,stage='Writing shared index and forecast',updated_at=? WHERE id=?",isoNow(),job.id);
+  await updateJobProgress(env,job.id,86,"Writing shared index and forecast");
   return result;
 }
 async function enqueueJob(env,job){
@@ -291,7 +321,7 @@ async function enqueueJob(env,job){
 async function requestAnalysis(req,env){
   const body=await req.json().catch(()=>({})),ticker=String(body.ticker||"").trim().toUpperCase(),indexer=String(body.save_to_indexer||body.indexer||"PreviewIndex").toLowerCase()==="fullindex"?"FullIndex":"PreviewIndex";
   if(!validTicker(ticker))return json({error:"Enter a valid stock ticker."},400);
-  const period=indexer==="FullIndex"?"10y":"5y",horizon=Number(body.horizon??(indexer==="FullIndex"?60:30)),maxAge=indexer==="FullIndex"?24:8,hardRescan=body.hard_rescan===true;
+  const period=indexer==="FullIndex"?"10y":"5y",horizon=Number(body.horizon??(indexer==="FullIndex"?60:30)),maxAge=INDEX_CACHE_HOURS,hardRescan=body.hard_rescan===true;
   if(!Number.isInteger(horizon)||horizon<1||horizon>504)return json({error:"Horizon must be a whole number from 1 to 504 trading days."},400);
   if(!await rateLimit(env,req,"analysis-request",90,3600000))return json({error:"Analysis request limit reached for this connection. Try later."},429);
   const cutoff=new Date(Date.now()-maxAge*3600000).toISOString();
@@ -317,13 +347,15 @@ async function analysisStatus(req,url,env){
     if(!user||user.id!==job.user_id)return json({error:"Analysis job not found."},404);
   }
   const {user_id,...visible}=job;
-  return json({...visible,result:parse(job.result),progress:job.status==="completed"?100:Number(job.progress||0)});
+  const progressSnapshot=env.AUTH_KV?await env.AUTH_KV.get("analysis-progress:"+id,"json").catch(()=>null):null;
+  const useSnapshot=progressSnapshot&&["queued","running"].includes(job.status);
+  return json({...visible,...(useSnapshot?progressSnapshot:{}),result:parse(job.result),progress:job.status==="completed"?100:Number(useSnapshot?progressSnapshot.progress:job.progress||0)});
 }
 async function indexAvailability(url,env){
   const ticker=(url.searchParams.get("ticker")||"").toUpperCase(),requestedHorizon=url.searchParams.get("horizon");
   if(requestedHorizon!==null&&(!Number.isInteger(Number(requestedHorizon))||Number(requestedHorizon)<1||Number(requestedHorizon)>504))return json({error:"Horizon must be a whole number from 1 to 504 trading days."},400);
   if(!validTicker(ticker))return json({error:"Enter a valid ticker."},400);
-  const definitions=[{id:"PreviewIndex",period:"5y",horizon:30,age:8},{id:"FullIndex",period:"10y",horizon:60,age:24}],indexes=[];
+  const definitions=[{id:"PreviewIndex",period:"5y",horizon:30,age:INDEX_CACHE_HOURS},{id:"FullIndex",period:"10y",horizon:60,age:INDEX_CACHE_HOURS}],indexes=[];
   for(const item of definitions){
     const cutoff=new Date(Date.now()-item.age*3600000).toISOString();
     const row=await first(env,"SELECT indexed_at FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=?",ticker,item.period,item.horizon,item.id,cutoff);
@@ -440,7 +472,7 @@ async function marketFeed(url,env,req){
   const placeholders=tickers.map(()=>"?").join(",");
   const [quoteRows,indexRows]=await Promise.all([
     all(env,"SELECT * FROM market_quotes WHERE ticker IN ("+placeholders+")",...tickers),
-    all(env,"SELECT ticker,period,indexer,indexed_at,result FROM market_index WHERE ticker IN ("+placeholders+") AND ((indexer='FullIndex' AND horizon=60 AND indexed_at>=?) OR (indexer='PreviewIndex' AND horizon=30 AND indexed_at>=?)) ORDER BY indexed_at DESC",...tickers,new Date(Date.now()-24*3600000).toISOString(),new Date(Date.now()-8*3600000).toISOString())
+    all(env,"SELECT ticker,period,indexer,indexed_at,result FROM market_index WHERE ticker IN ("+placeholders+") AND ((indexer='FullIndex' AND horizon=60 AND indexed_at>=?) OR (indexer='PreviewIndex' AND horizon=30 AND indexed_at>=?)) ORDER BY indexed_at DESC",...tickers,new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString(),new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString())
   ]);
   const quotesByTicker=new Map(quoteRows.map(row=>[row.ticker,row]));
   const catalogByTicker=new Map(catalog.map(row=>[row.ticker,row]));
@@ -457,29 +489,19 @@ async function marketFeed(url,env,req){
   });
   const refreshed=refreshAllowed?await mapLimit(tickers,6,async ticker=>{
     const cached=quotesByTicker.get(ticker)||null;
-    const cacheFresh=cached&&Date.now()-Date.parse(cached.updated_at||"")<5*60000;
-    if(cacheFresh)return {ticker,quote:cached};
+    const memory=localMarketQuotes.get(ticker);
+    if(memory&&Date.now()-memory.cachedAt<90000)return {ticker,quote:memory.quote};
     try{
       const quote=await yahooChart(ticker,"1y");
+      localMarketQuotes.set(ticker,{quote,cachedAt:Date.now()});
+      if(localMarketQuotes.size>160){for(const [key,value] of localMarketQuotes){if(Date.now()-value.cachedAt>10*60000)localMarketQuotes.delete(key);}}
       return {ticker,quote};
     }catch{
-      // A provider outage falls back to the last saved quote, not an empty feed.
       return {ticker,quote:cached||{ticker,company:catalogByTicker.get(ticker)?.company||ticker,currency:catalogByTicker.get(ticker)?.currency||"USD",price:null,change_percent:null,as_of:null,source:"Quote temporarily unavailable"}};
     }
   }):cachedItems;
-
-  const now=isoNow(),statements=[];
-  if(refreshAllowed)for(const item of refreshed){
-    const quote=item.quote;
-    if(quote.price!=null&&quote.company){
-      statements.push(stmt(env,"INSERT INTO market_quotes(ticker,company,currency,price,change_percent,as_of,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,price=excluded.price,change_percent=excluded.change_percent,as_of=excluded.as_of,source=excluded.source,updated_at=excluded.updated_at",item.ticker,quote.company,quote.currency||"USD",quote.price,quote.change_percent??null,quote.as_of||null,quote.source||"Yahoo Finance chart data",now));
-    }
-    const indexed=indexesByTicker.get(item.ticker);
-    if(quote.company){
-      statements.push(stmt(env,"INSERT INTO ticker_catalog(ticker,company,currency,last_indexed_at) VALUES(?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,last_indexed_at=COALESCE(excluded.last_indexed_at,ticker_catalog.last_indexed_at)",item.ticker,quote.company,quote.currency||"USD",indexed?.indexed_at||null));
-    }
-  }
-  if(statements.length)await env.DB.batch(statements);
+  // Volatile live quotes are not stored in D1; only completed shared indexes are persisted.
+  const now=isoNow();
 
   const items=refreshed.map(({ticker,quote})=>{
     const indexed=indexesByTicker.get(ticker),analysis=parse(indexed?.result);
@@ -497,6 +519,20 @@ async function marketFeed(url,env,req){
   const counts={PreviewIndex:0,FullIndex:0};
   for(const item of items)if(item.indexer)counts[item.indexer]++;
   return json({items,generated_at:now,index_counts:counts,stale:!refreshAllowed,refresh_limited:!refreshAllowed,message:refreshAllowed?"Market snapshot refreshed.":"Refresh limit reached; serving the saved D1 snapshot."});
+}
+async function cachedMarketFeed(url,env,req){
+  if(url.searchParams.has("q"))return marketFeed(url,env,req);
+  const cache=globalThis.caches?.default;
+  if(!cache)return marketFeed(url,env,req);
+  const key=new Request(new URL("/__finanx_cache/market-feed",url.origin).href);
+  try{const hit=await cache.match(key);if(hit)return hit;}
+  catch(error){console.warn("Finanx market-feed cache read skipped.",String(error?.message||error));}
+  const response=await marketFeed(url,env,req);
+  if(response.status===200){
+    try{const clone=response.clone(),headers=new Headers(clone.headers);headers.set("Cache-Control","public, max-age=60");await cache.put(key,new Response(clone.body,{status:clone.status,headers}));}
+    catch(error){console.warn("Finanx market-feed cache write skipped.",String(error?.message||error));}
+  }
+  return response;
 }
 async function watchlist(req,env){
   const user=await authUser(req,env);if(!user)return json({error:"Sign in to use your watchlist."},401);
@@ -530,7 +566,7 @@ async function watchlist(req,env){
     items=await all(env,"SELECT ticker,created_at FROM watchlist_items WHERE user_id=? ORDER BY created_at DESC",user.id);
   }
   const output=await Promise.all(items.map(async item=>{
-    const fullCutoff=new Date(Date.now()-24*3600000).toISOString(),previewCutoff=new Date(Date.now()-8*3600000).toISOString();
+    const fullCutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString(),previewCutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString();
     let row=await first(env,"SELECT result,indexed_at,indexer,horizon FROM market_index WHERE ticker=? AND period='10y' AND horizon=60 AND indexer='FullIndex' AND indexed_at>=?",item.ticker,fullCutoff);
     if(!row)row=await first(env,"SELECT result,indexed_at,indexer,horizon FROM market_index WHERE ticker=? AND period='5y' AND horizon=30 AND indexer='PreviewIndex' AND indexed_at>=?",item.ticker,previewCutoff);
     const analysis=parse(row?.result);
@@ -541,7 +577,7 @@ async function watchlist(req,env){
 async function requestMarketScan(req,env){
   if(!await rateLimit(env,req,"market-scan",30,3600000))return json({error:"Market Scan refresh limit reached. Try again later."},429);
   // Read PreviewIndex 30-day and FullIndex 60-day records only; never queues new analyses.
-  const previewCutoff=new Date(Date.now()-8*3600000).toISOString(),fullCutoff=new Date(Date.now()-24*3600000).toISOString();
+  const previewCutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString(),fullCutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString();
   const rows=await all(env,"SELECT ticker,period,indexer,horizon,indexed_at,result FROM market_index WHERE ((indexer='PreviewIndex' AND horizon=30 AND indexed_at>=?) OR (indexer='FullIndex' AND horizon=60 AND indexed_at>=?)) ORDER BY indexed_at DESC LIMIT 1000",previewCutoff,fullCutoff);
   const byTicker=new Map();
   for(const row of rows){
@@ -565,17 +601,17 @@ async function listJobs(req,env){
 async function processJob(id,env){
   const job=await first(env,"SELECT * FROM analysis_jobs WHERE id=?",id);
   if(!job||job.status==="completed")return;
-  const indexer=job.save_to_indexer==="FullIndex"?"FullIndex":"PreviewIndex",period=indexer==="FullIndex"?"10y":job.period||"5y",cooldownCutoff=new Date(Date.now()-6*3600000).toISOString();
+  const indexer=job.save_to_indexer==="FullIndex"?"FullIndex":"PreviewIndex",period=indexer==="FullIndex"?"10y":job.period||"5y",cooldownCutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString();
   const recent=await first(env,"SELECT result,indexed_at,source_job_id FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=? LIMIT 1",job.ticker,period,job.horizon,indexer,cooldownCutoff);
   if(recent?.result&&job.job_type!=="hard_rescan"){
-    await run(env,"UPDATE analysis_jobs SET status='completed',result=?,error=NULL,progress=100,stage='Six-hour cooldown active; reused existing index',updated_at=? WHERE id=?",recent.result,isoNow(),id);
+    await run(env,"UPDATE analysis_jobs SET status='completed',result=?,error=NULL,progress=100,stage='Eight-hour cache active; reused existing index',updated_at=? WHERE id=?",recent.result,isoNow(),id);
     return;
   }
   try{
     await run(env,"UPDATE analysis_jobs SET status='running',attempts=attempts+1,progress=3,stage='Starting analysis worker',updated_at=? WHERE id=?",isoNow(),id);
     const result=await makeAnalysis(env,job),stored=JSON.stringify(result);
     await run(env,"INSERT INTO market_index(ticker,period,horizon,indexer,indexed_at,source_job_id,result) VALUES(?,?,?,?,?,?,?) ON CONFLICT(ticker,period,horizon,indexer) DO UPDATE SET indexed_at=excluded.indexed_at,source_job_id=excluded.source_job_id,result=excluded.result",job.ticker,period,job.horizon,indexer,isoNow(),id,stored);
-    await run(env,"INSERT INTO ticker_catalog(ticker,company,currency,last_indexed_at,created_at) VALUES(?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET company=excluded.company,currency=excluded.currency,last_indexed_at=excluded.last_indexed_at",job.ticker,result.company,result.currency,isoNow(),isoNow());
+    await run(env,"INSERT OR IGNORE INTO ticker_catalog(ticker,company,currency,last_indexed_at,created_at) VALUES(?,?,?,?,?)",job.ticker,result.company,result.currency,isoNow(),isoNow());
     await run(env,"UPDATE analysis_jobs SET status='completed',result=?,error=NULL,progress=100,stage='Analysis complete',updated_at=? WHERE id=?",stored,isoNow(),id);
   }catch(error){
     const message=String(error?.message||error||"Analysis failed").slice(0,800);
@@ -602,21 +638,20 @@ async function discoverIndexTickers(){
   return [...new Set(found)];
 }
 async function refreshIndexes(env,indexer){
-  const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cooldownHours=6,cutoff=new Date(Date.now()-cooldownHours*3600000).toISOString();
+  const period=indexer==="FullIndex"?"10y":"5y",horizon=indexer==="FullIndex"?60:30,cutoff=new Date(Date.now()-INDEX_CACHE_HOURS*3600000).toISOString();
   const discovered=await discoverIndexTickers();
   const catalog=(await all(env,"SELECT ticker FROM ticker_catalog ORDER BY COALESCE(last_indexed_at,'') ASC LIMIT 500")).map(x=>x.ticker);
-  // Fresh market-screen discoveries always get first priority; catalog is a fallback/re-index pool.
-  const candidates=[...new Set([...discovered,...catalog,...POPULAR])];
-  const batch=[];
+  const [recentRows,activeRows]=await Promise.all([
+    all(env,"SELECT ticker FROM market_index WHERE period=? AND horizon=? AND indexer=? AND indexed_at>=?",period,horizon,indexer,cutoff),
+    all(env,"SELECT ticker FROM analysis_jobs WHERE save_to_indexer=? AND status IN ('queued','running')",indexer)
+  ]);
+  const recentTickers=new Set(recentRows.map(row=>row.ticker)),activeTickers=new Set(activeRows.map(row=>row.ticker));
+  const candidates=[...new Set([...discovered,...catalog,...POPULAR])],batch=[];
   for(const ticker of candidates){
-    if(!validTicker(ticker))continue;
-    const recent=await first(env,"SELECT indexed_at FROM market_index WHERE ticker=? AND period=? AND horizon=? AND indexer=? AND indexed_at>=? LIMIT 1",ticker,period,horizon,indexer,cutoff);
-    if(recent)continue;
-    const active=await first(env,"SELECT id FROM analysis_jobs WHERE ticker=? AND save_to_indexer=? AND status IN ('queued','running') LIMIT 1",ticker,indexer);
-    if(active)continue;
+    if(!validTicker(ticker)||recentTickers.has(ticker)||activeTickers.has(ticker))continue;
     const id=crypto.randomUUID(),created=isoNow();
     await run(env,"INSERT INTO analysis_jobs(id,ticker,period,horizon,save_to_indexer,status,created_at,updated_at,stage,progress) VALUES(?,?,?,?,?,'queued',?,?,?,0)",id,ticker,period,horizon,indexer,created,created,"Scheduled "+indexer+" discovery refresh");
-    batch.push({body:{jobId:id}});
+    activeTickers.add(ticker);batch.push({body:{jobId:id}});
     if(batch.length>=4)break;
   }
   if(batch.length){const queue=indexer==="FullIndex"?env.FULLINDEX_QUEUE:env.PREVIEWINDEX_QUEUE;if(!queue?.sendBatch)throw new Error(indexer+" queue binding is unavailable");await queue.sendBatch(batch);}
@@ -653,7 +688,7 @@ async function handleApi(req,env,url){
     }catch(error){return json({ok:false,service:"revised-finanx",database:"Unavailable",queue:typeof env.ANALYSIS_QUEUE?.send==="function"?"Cloudflare Queues":"Unavailable",time:isoNow()},503);}
   }
   if(path.startsWith("/api/auth/"))return authRoute(req,env,url);
-  if(path==="/api/market-feed"&&req.method==="GET")return marketFeed(url,env,req);
+  if(path==="/api/market-feed"&&req.method==="GET")return cachedMarketFeed(url,env,req);
   if(path==="/api/news"&&req.method==="GET")return newsRoute(url,env,req);
   if(path==="/api/news-article"&&req.method==="GET")return newsArticleRoute(url,env,req);
   if(path==="/api/indexed-stats"&&req.method==="GET")return indexedStats(env);
@@ -696,9 +731,9 @@ export default {
   },
   async scheduled(controller,env,ctx){
     const cron=controller.cron||"";
-    if(cron==="30 */6 * * *")ctx.waitUntil(refreshIndexes(env,"FullIndex"));
-    if(cron==="0 */6 * * *"){
-      ctx.waitUntil(refreshIndexes(env,"PreviewIndex"));
+    if(cron==="30 */8 * * *")ctx.waitUntil(refreshIndexes(env,"FullIndex"));
+    if(cron==="0 */8 * * *")ctx.waitUntil(refreshIndexes(env,"PreviewIndex"));
+    if(cron==="0 5 * * 0"){
       ctx.waitUntil(run(env,"DELETE FROM sessions WHERE expires_at<?",isoNow()));
       ctx.waitUntil(run(env,"DELETE FROM analysis_jobs WHERE status IN ('completed','failed') AND updated_at<?",new Date(Date.now()-14*86400000).toISOString()));
     }

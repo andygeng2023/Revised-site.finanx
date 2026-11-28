@@ -190,6 +190,42 @@ test("does not expose a user-owned analysis job to anonymous callers", async () 
   assert.equal(env.calls.sql.length, 1);
 });
 
+test("shared index cache hit returns without queueing or writing D1", async () => {
+  const env = testEnv({
+    firstResult: sql => sql.includes("FROM market_index")
+      ? { result: JSON.stringify({ ticker: "AAPL" }), indexed_at: new Date().toISOString(), source_job_id: "existing-job" }
+      : null
+  });
+  const response = await worker.fetch(new Request("https://finanx.test/api/request-analysis", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticker: "AAPL", indexer: "FullIndex" })
+  }), env, { waitUntil() {} });
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.cached, true);
+  assert.equal(body.ticker, "AAPL");
+  assert.equal(env.calls.queue, 0);
+  assert.equal(env.calls.sql.some(call => call.sql.includes("INSERT INTO analysis_jobs")), false);
+});
+
+test("market feed does not persist every quote refresh to D1", async () => {
+  const source = await readFile(new URL("../src/worker.js", import.meta.url), "utf8");
+  const marketFeed = source.slice(source.indexOf("async function marketFeed"), source.indexOf("async function cachedMarketFeed"));
+  assert.match(marketFeed, /localMarketQuotes/);
+  assert.doesNotMatch(marketFeed, /INSERT INTO market_quotes|INSERT INTO ticker_catalog|env\.DB\.batch/);
+  const handler = source.slice(source.indexOf("async function cachedMarketFeed"), source.indexOf("async function watchlist"));
+  assert.match(handler, /cache\.match/);
+  assert.match(handler, /cache\.put/);
+});
+
+test("global model learning is stored in KV once per day rather than multiple D1 rows", async () => {
+  const source = await readFile(new URL("../src/worker.js", import.meta.url), "utf8");
+  const updater = source.slice(source.indexOf("async function updateGlobalLearning"), source.indexOf("async function updateJobProgress"));
+  assert.match(updater, /AUTH_KV\.put/);
+  assert.match(updater, /24\*3600000/);
+  assert.doesNotMatch(updater, /env\.DB\.batch|INSERT INTO model_learning_state/);
+});
+
 test("market scan reads existing fresh indexes without enqueuing new work", async () => {
   const env = testEnv();
   const response = await worker.fetch(new Request("https://finanx.test/api/market-scan", { method: "POST", headers: { "Content-Type": "application/json", "cf-connecting-ip": "192.0.2.10" }, body: "{}" }), env, { waitUntil() {} });
@@ -273,10 +309,10 @@ test("PreviewIndex keeps a smaller candidate set while retaining all hybrid laye
   assert.equal(candidates.filter(x => x.type === "Primary hybrid").length, 1);
 });
 
-test("scheduled index refreshes are limited to four batches per day per index", async () => {
+test("scheduled index refreshes use an eight-hour cadence and remain capped at four jobs per run", async () => {
   const envPreview = testEnv();
   const previewPromises = [];
-  worker.scheduled({ cron: "0 */6 * * *" }, envPreview, { waitUntil: promise => previewPromises.push(promise) });
+  worker.scheduled({ cron: "0 */8 * * *" }, envPreview, { waitUntil: promise => previewPromises.push(promise) });
   await Promise.all(previewPromises);
   const previewInsert = envPreview.calls.sql.find(x => x.sql.includes("INSERT INTO analysis_jobs"));
   assert.ok(previewInsert, "Preview schedule must enqueue index work");
@@ -285,7 +321,7 @@ test("scheduled index refreshes are limited to four batches per day per index", 
 
   const envFull = testEnv();
   const fullPromises = [];
-  worker.scheduled({ cron: "30 */6 * * *" }, envFull, { waitUntil: promise => fullPromises.push(promise) });
+  worker.scheduled({ cron: "30 */8 * * *" }, envFull, { waitUntil: promise => fullPromises.push(promise) });
   await Promise.all(fullPromises);
   const fullInsert = envFull.calls.sql.find(x => x.sql.includes("INSERT INTO analysis_jobs"));
   assert.ok(fullInsert, "Full schedule must enqueue index work");
@@ -293,6 +329,15 @@ test("scheduled index refreshes are limited to four batches per day per index", 
   assert.ok(envFull.calls.batchMessages.length > 0);
 });
 
+
+test("weekly housekeeping is separated from index refreshes", async () => {
+  const env = testEnv();
+  const promises = [];
+  worker.scheduled({ cron: "0 5 * * 0" }, env, { waitUntil: promise => promises.push(promise) });
+  await Promise.all(promises);
+  assert.ok(env.calls.sql.some(call => call.sql.includes("DELETE FROM sessions")));
+  assert.ok(env.calls.sql.some(call => call.sql.includes("DELETE FROM analysis_jobs")));
+});
 
 test("Worker PBKDF2 iterations stay within the WebCrypto limit", async () => {
   const source = await readFile(new URL("../src/worker.js", import.meta.url), "utf8");
