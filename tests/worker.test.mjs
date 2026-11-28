@@ -136,6 +136,13 @@ test("unknown API routes return 404", async () => {
   assert.equal(response.status, 404);
 });
 
+test("PreviewIndex and FullIndex have fixed 30 and 60 day horizons", async () => {
+  const source = await readFile(new URL("../src/worker.js", import.meta.url), "utf8");
+  assert.match(source, /indexer==="FullIndex"\?60:30/);
+  assert.match(source, /horizon:30/);
+  assert.match(source, /horizon:60/);
+});
+
 test("rejects unsupported forecast horizons before querying D1", async () => {
   const env = testEnv();
   const response = await worker.fetch(new Request("https://finanx.test/api/index-availability?ticker=AAPL&horizon=0"), env, { waitUntil() {} });
