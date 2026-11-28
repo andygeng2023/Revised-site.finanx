@@ -225,7 +225,9 @@ test("index discovery runs continuously, respects 30000 caps, and recovers stale
   assert.match(source, /Scheduled .*continuous discovery refresh/);
   assert.match(source, /cron==="\*\/5 \* \* \* \*"/);
   assert.match(source, /staleCutoff=new Date\(Date\.now\(\)-2\*3600000\)/);
-  assert.match(source, /Recovered stale job; requeued by scheduled scan/);
+  assert.match(source, /Recovered job; requeued by scheduled scan/);
+  assert.match(source, /fixedCodeFailures/);
+  assert.match(source, /error LIKE '%dailyVol%'/);
   assert.match(source, /sendBatch\(batch\)/);
   assert.match(source, /job_type='scan'/);
   assert.match(source, /LIMIT 100/);
@@ -233,6 +235,7 @@ test("index discovery runs continuously, respects 30000 caps, and recovers stale
   assert.match(source, /queue completions immediately continue the scan pipeline/);
   const status = source.slice(source.indexOf("async function queueStatus"), source.indexOf("async function searchRoute"));
   assert.match(status, /user_id IS NULL/);
+  assert.match(status, /anonymous/);
   assert.match(status, /user_id=\?/);
   const consumer = source.slice(source.indexOf("  async queue(batch,env){"), source.indexOf("  async scheduled(controller,env,ctx){"));
   assert.match(consumer, /completed\?\.jobType==="scan"/);
