@@ -33,5 +33,7 @@ jobs:
         run: |
           curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 3 "$WORKER_ORIGIN/api/health"
           curl --fail --silent --show-error "$WORKER_ORIGIN/" --output /tmp/finanx-home.html
-          grep -Fq "Market Activity" /tmp/finanx-home.html
+          grep -Fq "Stocks to explore" /tmp/finanx-home.html
+          grep -Fq "home-featured-cards" /tmp/finanx-home.html
           grep -Fq "Market Scan" /tmp/finanx-home.html
+          ! grep -Fq "Market Activity" /tmp/finanx-home.html
